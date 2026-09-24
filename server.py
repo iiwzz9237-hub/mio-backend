@@ -164,6 +164,45 @@ def get_recent_notifications(user_id, limit=10):
     return notifications
 
 
+def get_queue_position(user_id):
+    """
+    موقعیت کاربر تو صف برداشت‌های در حال انتظار (status=0)
+    """
+    db_execute(
+        """
+        SELECT id, user_id
+        FROM withdraw_queue
+        WHERE status=0
+        ORDER BY id ASC
+        """
+    )
+    rows = cursor.fetchall()
+
+    position = 0
+    for row in rows:
+        position += 1
+        if row[1] == user_id:
+            return position
+
+    return 0
+
+
+def get_wait_text(position):
+    if position <= 1:
+        return "همین الان واریز می‌شود"
+
+    seconds = (position - 1) * 35
+    minute = seconds // 60
+    second = seconds % 60
+
+    if minute > 0 and second > 0:
+        return f"{minute} دقیقه و {second} ثانیه تا واریز"
+    elif minute > 0:
+        return f"{minute} دقیقه تا واریز"
+    else:
+        return f"{second} ثانیه تا واریز"
+
+
 # ================= ROUTES =================
 
 @app.route("/")
@@ -246,7 +285,13 @@ def api_withdraw():
     )
     db.commit()
 
-    return jsonify({"ok": True})
+    position = get_queue_position(user_id)
+
+    return jsonify({
+        "ok": True,
+        "position": position,
+        "wait_text": get_wait_text(position)
+    })
 
 
 @app.route("/api/withdraw-status")
@@ -275,7 +320,12 @@ def api_withdraw_status():
     status_code = row[0]
 
     if status_code in (0, 1):
-        return jsonify({"status": "pending"})
+        position = get_queue_position(user_id)
+        return jsonify({
+            "status": "pending",
+            "position": position,
+            "wait_text": get_wait_text(position)
+        })
     elif status_code == 2:
         return jsonify({"status": "success"})
     else:
