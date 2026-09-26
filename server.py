@@ -2,6 +2,8 @@ import os
 import time
 import hmac
 import hashlib
+from datetime import datetime, timedelta, timezone
+
 from urllib.parse import parse_qsl
 
 import psycopg2
@@ -112,6 +114,21 @@ def get_authenticated_user():
     return verify_init_data(init_data)
 
 
+# ================= TIME (Iran) =================
+
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+
+def to_iran_time_str(unix_timestamp):
+    """
+    تبدیل timestamp به رشته‌ی زمان به وقت ایران (UTC+03:30)
+    """
+    if not unix_timestamp:
+        return ""
+    dt = datetime.fromtimestamp(unix_timestamp, tz=IRAN_TZ)
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
 # ================= DB HELPERS (مشترک با بات) =================
 
 MAX_BALANCE = 500000
@@ -147,7 +164,7 @@ def get_recent_notifications(user_id, limit=10):
 
     notifications = []
     for amount, status, created_time in rows:
-        t = time.strftime("%Y-%m-%d %H:%M", time.localtime(created_time)) if created_time else ""
+        t = to_iran_time_str(created_time)
         if status == 2:
             notifications.append({
                 "type": "success",
