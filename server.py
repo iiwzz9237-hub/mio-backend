@@ -311,6 +311,57 @@ def api_withdraw():
     })
 
 
+@app.route("/api/withdraw-bank", methods=["POST"])
+def api_withdraw_bank():
+    """
+    برداشت با بانک میویی (کارت به کارت) — فعلاً فقط برای تست مینی‌اپ.
+    پردازش واقعی این نوع درخواست هنوز در یوزربات پیاده نشده.
+    """
+    user = get_authenticated_user()
+    if not user:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    user_id = user["id"]
+    data = request.get_json(silent=True) or {}
+    card = (data.get("card") or "").strip()
+
+    if not card.isdigit() or not (10 <= len(card) <= 20):
+        return jsonify({"ok": False, "error": "invalid_card"}), 400
+
+    balance = get_balance(user_id)
+    if balance <= 0:
+        return jsonify({"ok": False, "error": "zero_balance"}), 400
+
+    # جلوگیری از ثبت چند درخواست هم‌زمان (هر نوعی که باشه)
+    db_execute(
+        """
+        SELECT id FROM withdraw_queue
+        WHERE user_id=%s AND status IN (0,1)
+        """,
+        (user_id,)
+    )
+    if cursor.fetchone():
+        return jsonify({"ok": False, "error": "already_pending"}), 400
+
+    db_execute(
+        """
+        INSERT INTO withdraw_queue
+        (user_id, target_username, amount, withdraw_type, status, created_time)
+        VALUES (%s,%s,%s,'card',0,%s)
+        """,
+        (user_id, card, balance, time.time())
+    )
+    db.commit()
+
+    position = get_queue_position(user_id)
+
+    return jsonify({
+        "ok": True,
+        "position": position,
+        "wait_text": get_wait_text(position)
+    })
+
+
 @app.route("/api/withdraw-status")
 def api_withdraw_status():
     user = get_authenticated_user()
