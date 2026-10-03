@@ -1,685 +1,1013 @@
-from telethon import TelegramClient, events
-import psycopg2
-import asyncio
+import os
+import re
+import json
 import time
+import math
+import uuid
+import hmac
+import secrets
+import hashlib
 
-from config import DATABASE_URL_TABLET
+from collections import Counter
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+from urllib.parse import parse_qsl
 
-# ================= API =================
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json
 
-API_ID = 36849785
-API_HASH = "fcfe769c08575c9bbeb92e87fd340983"
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-client = TelegramClient(
-    "mio_account",
-    API_ID,
-    API_HASH
-)
-
-# ================= DATABASE =================
-
-db = psycopg2.connect(DATABASE_URL_TABLET)
-db.autocommit = False
-
-cursor = db.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS withdraw_success(
-    user_id BIGINT PRIMARY KEY,
-    status INTEGER DEFAULT 1
-)
-""")
-
-# جدول صف برداشت
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS withdraw_queue(
-    id SERIAL PRIMARY KEY,
-    user_id BIGINT,
-    target_username TEXT,
-    amount BIGINT,
-    withdraw_type TEXT,
-    status INTEGER DEFAULT 0,
-    created_time DOUBLE PRECISION,
-    message_id BIGINT
-)
-""")
-
-# جدول رسیدها (با نوع برداشت)
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS withdraw_receipts(
-    user_id BIGINT PRIMARY KEY,
-    message_id BIGINT,
-    withdraw_type TEXT
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS receipt_request(
-    user_id BIGINT PRIMARY KEY,
-    request INTEGER DEFAULT 0
-)
-""")
-
-db.commit()
-
-# ================= DB HELPER =================
-
-def db_execute(query, params=None):
-    """
-    اجرای امن کوئری با تلاش مجدد در صورت قطعی کانکشن
-    """
-    global db, cursor
-    try:
-        cursor.execute(query, params or ())
-    except (psycopg2.InterfaceError, psycopg2.OperationalError):
-        db = psycopg2.connect(DATABASE_URL_TABLET)
-        db.autocommit = False
-        cursor = db.cursor()
-        cursor.execute(query, params or ())
-
-# ================= BALANCE =================
-
-def get_balance(user_id):
-    db_execute(
-        """
-        SELECT balance
-        FROM users
-        WHERE user_id=%s
-        """,
-        (user_id,)
-    )
-    result = cursor.fetchone()
-    if result:
-        return result[0]
-    return 0
-
-def reset_balance(user_id):
-    db_execute(
-        """
-        UPDATE users
-        SET balance=0
-        WHERE user_id=%s
-        """,
-        (user_id,)
-    )
-    db.commit()
 
 # ================= CONFIG =================
 
-WITHDRAW_GROUP = "panke_saghfe"
-ID_GROUP = "themaws_gap"
-MEOWIE = "MeowieQIVBot"
+DATABASE_URL = os.environ.get("DATABASE_URL")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_USERNAME = (os.environ.get("BOT_USERNAME") or "").lstrip("@")
 
-ACTIVE_WITHDRAW = None
-LAST_TRANSFER_TIME = 0
-TRANSFER_DELAY = 35
-CONFIRM_TIMEOUT = 30
-CONFIRM_RETRY = 3
+GAME_ENABLED = (
+    os.environ.get("GAME_ENABLED", "true").strip().lower()
+    in {"true", "1", "yes", "on"}
+)
 
-# ================= QUEUE FUNCTIONS =================
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL تنظیم نشده است.")
 
-def add_withdraw_queue(user_id, target_username, amount, withdraw_type, message_id):
-    db_execute(
-        """
-        INSERT INTO withdraw_queue
-        (user_id, target_username, amount, withdraw_type, status, created_time, message_id)
-        VALUES (%s,%s,%s,%s,0,%s,%s)
-        """,
-        (user_id, target_username, amount, withdraw_type, time.time(), message_id)
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
+
+app = Flask(__name__)
+CORS(app)
+
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+DAILY_AMOUNT = 340000
+DAILY_BALANCE_CAP = 500000
+
+NORMAL_TRANSFER_DELAY = 35
+BANK_TRANSFER_DELAY = 240
+
+GAME_COOLDOWN = timedelta(hours=48)
+
+GAME_SYMBOLS = ("seven", "grape", "lemon", "blank")
+
+GAME_PAYOUTS = {
+    "seven": [0, 100000, 200000, 400000],
+    "grape": [0, 30000, 60000, 80000],
+    "lemon": [0, 10000, 20000, 30000],
+    "blank": [0, 0, 0, 0],
+}
+
+
+# ================= DATABASE =================
+
+@contextmanager
+def db_transaction():
+    connection = psycopg2.connect(
+        DATABASE_URL,
+        connect_timeout=10,
     )
-    db.commit()
-
-def set_withdraw_status(request_id, status):
-    db_execute(
-        """
-        UPDATE withdraw_queue
-        SET status=%s
-        WHERE id=%s
-        """,
-        (status, request_id)
-    )
-    db.commit()
-
-def get_next_withdraw():
-    db_execute(
-        """
-        SELECT id, user_id, target_username, amount, withdraw_type, message_id
-        FROM withdraw_queue
-        WHERE status=0
-        ORDER BY id ASC
-        LIMIT 1
-        """
-    )
-    return cursor.fetchone()
-
-def fail_active_withdraw():
-    global ACTIVE_WITHDRAW
-
-    if not ACTIVE_WITHDRAW:
-        return
-
-    db_execute(
-        """
-        UPDATE withdraw_queue
-        SET status=3
-        WHERE id=%s
-        """,
-        (ACTIVE_WITHDRAW["id"],)
-    )
-    db.commit()
-
-    print("❌ انتقال ناموفق ثبت شد")
-
-    ACTIVE_WITHDRAW = None
-
-MEOWIE_ID = None
-
-
-async def get_meowie_id():
-    """
-    آیدی عددی Meowie رو یه بار می‌گیره و کش می‌کنه (برای فیلتر دقیق‌تر پیام‌ها).
-    """
-    global MEOWIE_ID
-    if MEOWIE_ID is None:
-        entity = await client.get_entity(MEOWIE)
-        MEOWIE_ID = entity.id
-    return MEOWIE_ID
-
-
-async def find_meowie_reply(reply_to_id, must_contain=None, button_text=None, timeout=30):
-    """
-    پیام Meowie رو پیدا می‌کنه که:
-      - دقیقاً ریپلای روی پیام ما (reply_to_id) باشه
-      - (اختیاری) متنش شامل یکی از عبارت‌های must_contain باشه
-      - (اختیاری) دکمه‌ای شامل button_text داشته باشه
-    گپ شلوغه و Meowie به بقیه هم جواب میده؛ این فیلتر جلوی اشتباه گرفتن رو می‌گیره.
-    """
-    meowie_id = await get_meowie_id()
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        msgs = await client.get_messages(WITHDRAW_GROUP, limit=40)
-
-        for m in msgs:
-            if m.sender_id != meowie_id:
-                continue
-            if not m.reply_to or m.reply_to.reply_to_msg_id != reply_to_id:
-                continue
-
-            text = m.raw_text or ""
-
-            if must_contain and not any(t in text for t in must_contain):
-                continue
-
-            if button_text:
-                found = False
-                for row in (m.buttons or []):
-                    for btn in row:
-                        if btn.text and button_text in btn.text:
-                            found = True
-                if not found:
-                    continue
-
-            return m
-
-        await asyncio.sleep(1)
-
-    return None
-
-
-async def find_confirm_panel(card, min_id, timeout=30):
-    """
-    پنل تایید نهایی (شامل شماره‌حساب ما و دکمه‌ی «تایید تراکنش») رو پیدا می‌کنه.
-    Meowie ممکنه پیام قبلی رو edit کنه یا پیام جدید بفرسته؛ هر دو حالت پوشش داده میشه.
-    """
-    meowie_id = await get_meowie_id()
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        msgs = await client.get_messages(WITHDRAW_GROUP, limit=40)
-
-        for m in msgs:
-            if m.sender_id != meowie_id or m.id < min_id:
-                continue
-            if card not in (m.raw_text or ""):
-                continue
-            if not m.buttons:
-                continue
-
-            for row in m.buttons:
-                for btn in row:
-                    if btn.text and "تایید تراکنش" in btn.text:
-                        return m
-
-        await asyncio.sleep(1)
-
-    return None
-
-
-async def click_button_containing(msg, text):
-    """
-    تو دکمه‌های شیشه‌ای یه پیام دنبال دکمه‌ای می‌گرده که شامل متن داده‌شده باشه
-    و روش کلیک می‌کنه. اگه پیدا نشد False برمی‌گردونه.
-    """
-    if not msg.buttons:
-        return False
-
-    for row in msg.buttons:
-        for btn in row:
-            if btn.text and text in btn.text:
-                await btn.click()
-                return True
-
-    return False
-
-
-async def process_bank_card_withdraw(request_id, user_id, card, amount):
-    """
-    پردازش برداشت با بانک میویی (کارت به کارت):
-    ۱) ارسال پیام «بانک میویی»
-    ۲) پیدا کردن پنل «کارت به کارت میویی» که Meowie روی پیام ما ریپلای کرده
-    ۳) ریپلای دقیق روی همون پنل با «مبلغ شماره‌حساب»
-    ۴) پیدا کردن پنل تایید و کلیک روی «تایید تراکنش»
-    """
-    global LAST_TRANSFER_TIME
-
-    amount_text = f"{amount}"
 
     try:
-        # ۱) ارسال «بانک میویی»
-        sent = await client.send_message(WITHDRAW_GROUP, "بانک میویی")
-
-        # ۲) منوی Meowie (ریپلای روی پیام ما) که دکمه‌ی «کارت به کارت میویی» داره
-        menu_msg = await find_meowie_reply(
-            sent.id,
-            button_text="کارت به کارت",
-            timeout=30
-        )
-
-        if not menu_msg:
-            print("❌ منوی بانک میویی (با دکمه کارت به کارت) از Meowie نیومد")
-            set_withdraw_status(request_id, 3)
-            return
-
-        if not await click_button_containing(menu_msg, "کارت به کارت"):
-            print("❌ دکمه «کارت به کارت میویی» پیدا نشد")
-            set_withdraw_status(request_id, 3)
-            return
-
-        # ۳) بعد از کلیک، پنل «لطفا مبلغ و شماره حساب رو در جواب همین پنل وارد کنید» میاد
-        #    (Meowie ممکنه همون پیام منو رو edit کنه یا پیام جدید بفرسته)
-        prompt_msg = await find_meowie_reply(
-            sent.id,
-            must_contain=["در جواب همین پنل", "تعیین مبلغ"],
-            timeout=30
-        )
-
-        if not prompt_msg:
-            print("❌ پنل «مبلغ و شماره حساب» از Meowie نیومد")
-            set_withdraw_status(request_id, 3)
-            return
-
-        # ۴) ریپلای دقیق روی همون پنل با «مبلغ شماره‌حساب»
-        await client.send_message(
-            WITHDRAW_GROUP,
-            f"{amount_text} {card}",
-            reply_to=prompt_msg.id
-        )
-
-        # ۵) پنل تایید (با شماره‌حساب ما و دکمه‌ی تایید تراکنش)
-        confirm_msg = await find_confirm_panel(
-            card,
-            min_id=prompt_msg.id,
-            timeout=30
-        )
-
-        if not confirm_msg:
-            print("❌ پنل تایید تراکنش از Meowie نیومد")
-            set_withdraw_status(request_id, 3)
-            return
-
-        if not await click_button_containing(confirm_msg, "تایید تراکنش"):
-            print("❌ دکمه «تایید تراکنش» پیدا نشد")
-            set_withdraw_status(request_id, 3)
-            return
-
-        # کمی صبر تا Meowie تراکنش رو نهایی کنه
-        await asyncio.sleep(3)
-
-        final_msg = await client.get_messages(WITHDRAW_GROUP, ids=confirm_msg.id)
-        final_text = final_msg.raw_text if final_msg else ""
-        print(f"📩 وضعیت نهایی بانک میویی برای {user_id}: {final_text}")
-
-        # همه‌ی مراحل بدون خطا طی شد -> موفق ثبت کن
-        # (پیام موفقیت و ریست موجودی همون‌طور که برای روش «آیدی» هست،
-        #  توسط حلقه‌ی check_withdraw_success تو bot.py انجام می‌شود)
-        set_withdraw_status(request_id, 2)
-
-        db_execute(
-            """
-            INSERT INTO withdraw_receipts (user_id, message_id, withdraw_type)
-            VALUES (%s,%s,'card')
-            ON CONFLICT (user_id) DO UPDATE SET
-                message_id=EXCLUDED.message_id,
-                withdraw_type=EXCLUDED.withdraw_type
-            """,
-            (user_id, confirm_msg.id)
-        )
-
-        db_execute(
-            """
-            INSERT INTO withdraw_success (user_id, status)
-            VALUES (%s,1)
-            ON CONFLICT (user_id) DO UPDATE SET status=EXCLUDED.status
-            """,
-            (user_id,)
-        )
-        db.commit()
-
-        print(f"🎉 برداشت با بانک میویی موفق: {user_id} مقدار {amount_text}")
-
-    except Exception as e:
-        print("❌ خطا در پردازش بانک میویی:", e)
-        set_withdraw_status(request_id, 3)
-
+        with connection:
+            with connection.cursor(
+                cursor_factory=RealDictCursor
+            ) as cur:
+                yield cur
     finally:
-        LAST_TRANSFER_TIME = time.time()
+        connection.close()
 
 
-# ================= PROCESS WITHDRAW QUEUE =================
+def init_database():
+    with db_transaction() as cur:
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(%s)",
+            (748219306,),
+        )
 
-async def process_withdraw_queue():
-    global ACTIVE_WITHDRAW
-    global LAST_TRANSFER_TIME
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS mio_game_rounds (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                request_id UUID NOT NULL,
+                symbols JSONB NOT NULL,
+                reward BIGINT NOT NULL CHECK (reward >= 0),
+                balance_after BIGINT NOT NULL,
+                played_at TIMESTAMPTZ NOT NULL,
+                next_play_at TIMESTAMPTZ NOT NULL,
+                UNIQUE (user_id, request_id),
+                CHECK (next_play_at > played_at)
+            )
+        """)
 
-    while True:
-        try:
-            if ACTIVE_WITHDRAW:
-                if time.time() - ACTIVE_WITHDRAW["time"] > CONFIRM_TIMEOUT:
-                    print("⏰ تایم اوت انتقال")
-                    fail_active_withdraw()
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS
+                mio_game_rounds_user_latest_idx
+            ON mio_game_rounds (user_id, id DESC)
+        """)
 
-                await asyncio.sleep(3)
-                continue
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS withdraw_transfer_limits (
+                method TEXT PRIMARY KEY,
+                delay_seconds INTEGER NOT NULL
+                    CHECK (delay_seconds > 0),
+                next_allowed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+                updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+            )
+        """)
 
-            if time.time() - LAST_TRANSFER_TIME < TRANSFER_DELAY:
-                await asyncio.sleep(3)
-                continue
+        # سرور زمان ذخیره‌شده توسط یوزربات را بازنشانی نمی‌کند.
+        cur.execute("""
+            INSERT INTO withdraw_transfer_limits (
+                method,
+                delay_seconds,
+                next_allowed_at,
+                updated_at
+            )
+            VALUES
+                ('normal', %s, 0, 0),
+                ('card', %s, 0, 0)
+            ON CONFLICT (method) DO NOTHING
+        """, (
+            NORMAL_TRANSFER_DELAY,
+            BANK_TRANSFER_DELAY,
+        ))
 
-            request = get_next_withdraw()
 
-            if not request:
-                await asyncio.sleep(3)
-                continue
+@app.errorhandler(psycopg2.Error)
+def database_error(error):
+    app.logger.exception("Database operation failed")
 
-            request_id = request[0]
-            user_id = request[1]
-            target = request[2]
-            amount = request[3]
-            withdraw_type = request[4]
-            message_id = request[5]
+    return jsonify({
+        "ok": False,
+        "error": "database_unavailable",
+    }), 503
 
-            amount_text = f"{amount:,}"
 
-            # برداشت با بانک میویی -> جریان مکالمه‌ای جدا (بلاک‌کننده تا پایان)
-            if withdraw_type == "card":
-                set_withdraw_status(request_id, 1)
-                print(f"🏦 شروع برداشت بانک میویی {user_id} مقدار {amount_text}")
-                await process_bank_card_withdraw(request_id, user_id, target, amount)
-                continue
+# ================= AUTH =================
 
-            try:
-                # برداشت با آیدی
-                if withdraw_type == "id":
-                    msg = await client.send_message(
-                        ID_GROUP,
-                        f"انتقال میویی {amount_text} {target}"
-                    )
-                # برداشت گپی با ریپلای
-                else:
-                    msg = await client.send_message(
-                        WITHDRAW_GROUP,
-                        f"انتقال میویی {amount_text}",
-                        reply_to=message_id
-                    )
-
-            except Exception as e:
-                print("❌ خطا در ارسال انتقال:", e)
-                set_withdraw_status(request_id, 3)
-                await asyncio.sleep(5)
-                continue
-
-            ACTIVE_WITHDRAW = {
-                "id": request_id,
-                "user_id": user_id,
-                "amount": amount,
-                "type": withdraw_type,
-                "message_id": msg.id,
-                "time": time.time()
-            }
-
-            set_withdraw_status(request_id, 1)
-
-            LAST_TRANSFER_TIME = time.time()
-
-            print(f"🚀 شروع انتقال {user_id} مقدار {amount_text}")
-
-        except Exception as e:
-            # قطعی موقت اینترنت/دیتابیس؛ کل یوزربات نباید کرش کنه
-            print("خطا در حلقه‌ی process_withdraw_queue (نادیده گرفته شد):", e)
-            await asyncio.sleep(5)
-
-# ================= AUTO CONFIRM =================
-
-@client.on(events.NewMessage(from_users=MEOWIE))
-async def meowie_handler(event):
-    global ACTIVE_WITHDRAW
-
-    if not ACTIVE_WITHDRAW:
-        return
-
-    text = event.raw_text
-
-    if "آیا از انتقال" not in text:
-        return
-
-    print("📩 پیام تایید Meowie دریافت شد")
-
-    confirmed = False
-
-    for attempt in range(CONFIRM_RETRY):
-        try:
-            await event.click(0, 0)
-            confirmed = True
-            print("✅ دکمه تایید زده شد")
-            break
-
-        except Exception as e:
-            print(f"❌ تلاش {attempt+1} ناموفق:", e)
-            await asyncio.sleep(2)
-
-    if not confirmed:
-        return
+def verify_init_data(init_data):
+    if not init_data or len(init_data) > 20000:
+        return None
 
     try:
-        await asyncio.sleep(3)
-
-        user_id = ACTIVE_WITHDRAW["user_id"]
-        request_id = ACTIVE_WITHDRAW["id"]
-        withdraw_type = ACTIVE_WITHDRAW["type"]
-
-        db_execute(
-            """
-            INSERT INTO withdraw_receipts (user_id, message_id, withdraw_type)
-            VALUES (%s,%s,%s)
-            ON CONFLICT (user_id) DO UPDATE SET
-                message_id=EXCLUDED.message_id,
-                withdraw_type=EXCLUDED.withdraw_type
-            """,
-            (user_id, event.id, withdraw_type)
+        items = parse_qsl(
+            init_data,
+            keep_blank_values=True,
+            strict_parsing=True,
         )
 
-        db_execute(
-            """
-            INSERT INTO withdraw_success (user_id, status)
-            VALUES (%s,1)
-            ON CONFLICT (user_id) DO UPDATE SET status=EXCLUDED.status
-            """,
-            (user_id,)
+        pairs = dict(items)
+
+        if len(items) != len(pairs):
+            return None
+
+        received_hash = pairs.pop("hash", None)
+
+        if not received_hash:
+            return None
+
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", received_hash):
+            return None
+
+        data_check_string = "\n".join(
+            f"{key}={value}"
+            for key, value in sorted(pairs.items())
         )
 
-        db_execute(
-            """
-            UPDATE withdraw_queue
-            SET status=2
-            WHERE id=%s
-            """,
-            (request_id,)
+        secret_key = hmac.new(
+            b"WebAppData",
+            BOT_TOKEN.encode(),
+            hashlib.sha256,
+        ).digest()
+
+        computed_hash = hmac.new(
+            secret_key,
+            data_check_string.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(
+            computed_hash,
+            received_hash.lower(),
+        ):
+            return None
+
+        auth_date = int(pairs.get("auth_date", "0"))
+        now = time.time()
+
+        if auth_date <= 0:
+            return None
+
+        if now - auth_date > 86400:
+            return None
+
+        if auth_date > now + 30:
+            return None
+
+        user = json.loads(pairs.get("user", ""))
+
+        if not isinstance(user, dict):
+            return None
+
+        user_id = user.get("id")
+
+        if (
+            not isinstance(user_id, int)
+            or isinstance(user_id, bool)
+            or user_id <= 0
+        ):
+            return None
+
+        return {
+            "id": user_id,
+            "username": user.get("username"),
+            "first_name": user.get("first_name"),
+        }
+
+    except (ValueError, TypeError):
+        return None
+
+
+def get_authenticated_user():
+    header = request.headers.get("Authorization", "")
+
+    if not header.startswith("tma "):
+        return None
+
+    return verify_init_data(header[4:])
+
+
+def authenticated(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        user = get_authenticated_user()
+
+        if not user:
+            return jsonify({
+                "ok": False,
+                "error": "unauthorized",
+            }), 401
+
+        return view(user, *args, **kwargs)
+
+    return wrapped
+
+
+def json_body():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+# ================= USER / TIME HELPERS =================
+
+def database_now(cur):
+    cur.execute("SELECT clock_timestamp() AS now")
+    return cur.fetchone()["now"]
+
+
+def get_user_row(cur, user_id, lock=False):
+    query = """
+        SELECT user_id, balance, daily_mio
+        FROM users
+        WHERE user_id=%s
+    """
+
+    if lock:
+        query += " FOR UPDATE"
+
+    cur.execute(query, (user_id,))
+    return cur.fetchone()
+
+
+def user_balance(row):
+    return int(row["balance"] or 0)
+
+
+def to_iran_time_str(timestamp):
+    if not timestamp:
+        return ""
+
+    dt = datetime.fromtimestamp(
+        float(timestamp),
+        tz=IRAN_TZ,
+    )
+
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+# ================= WITHDRAW QUEUE HELPERS =================
+
+def get_pending_withdrawal(cur, user_id):
+    cur.execute("""
+        SELECT id, user_id, amount, status, withdraw_type
+        FROM withdraw_queue
+        WHERE user_id=%s AND status IN (0, 1)
+        ORDER BY id DESC
+        LIMIT 1
+    """, (user_id,))
+
+    return cur.fetchone()
+
+
+def format_queue_duration(seconds):
+    seconds = max(0, int(seconds))
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts = []
+
+    if hours:
+        parts.append(f"{hours} ساعت")
+
+    if minutes:
+        parts.append(f"{minutes} دقیقه")
+
+    if seconds:
+        parts.append(f"{seconds} ثانیه")
+
+    return " و ".join(parts) if parts else "چند لحظه"
+
+
+def withdrawal_payload(cur, row):
+    if not row:
+        return {"status": "none"}
+
+    status_code = row["status"]
+    is_bank = row["withdraw_type"] == "card"
+
+    method = "card" if is_bank else "normal"
+    queue_label = "بانک میویی" if is_bank else "انتقال میویی"
+
+    result = {
+        "withdraw_id": row["id"],
+        "amount": int(row["amount"] or 0),
+        "withdraw_type": row["withdraw_type"],
+        "queue_type": method,
+    }
+
+    if status_code == 2:
+        result["status"] = "success"
+        return result
+
+    if status_code not in (0, 1):
+        result["status"] = "failed"
+        return result
+
+    if status_code == 1:
+        result.update({
+            "status": "pending",
+            "position": 0,
+            "wait_seconds": 0,
+            "wait_text": (
+                "در حال انجام مراحل بانک میویی"
+                if is_bank
+                else "در حال پردازش انتقال"
+            ),
+        })
+
+        return result
+
+    # جایگاه کاربر در صف روش برداشت خودش.
+    # برداشت بانکی از برداشت آیدی/گپی جدا محاسبه می‌شود.
+    cur.execute("""
+        SELECT COUNT(*) AS position
+        FROM withdraw_queue
+        WHERE
+            status=0
+            AND id <= %s
+            AND (
+                CASE
+                    WHEN withdraw_type='card' THEN 'card'
+                    ELSE 'normal'
+                END
+            ) = %s
+    """, (row["id"], method))
+
+    position = max(
+        1,
+        int(cur.fetchone()["position"]),
+    )
+
+    # همان زمان ثبت‌شده توسط یوزربات.
+    cur.execute("""
+        SELECT
+            delay_seconds,
+            next_allowed_at,
+            EXTRACT(EPOCH FROM clock_timestamp())::double precision
+                AS server_now
+        FROM withdraw_transfer_limits
+        WHERE method=%s
+    """, (method,))
+
+    limit_row = cur.fetchone()
+
+    if limit_row:
+        delay_seconds = int(limit_row["delay_seconds"])
+
+        cooldown_remaining = max(
+            0,
+            math.ceil(
+                float(limit_row["next_allowed_at"])
+                - float(limit_row["server_now"])
+            ),
+        )
+    else:
+        delay_seconds = (
+            BANK_TRANSFER_DELAY
+            if is_bank
+            else NORMAL_TRANSFER_DELAY
         )
 
-        db.commit()
+        cooldown_remaining = 0
 
-        reset_balance(user_id)
-
-        print(f"🎉 انتقال موفق: {user_id}")
-
-        # رسید دیگه اینجا خودکار فرستاده نمی‌شه؛
-        # فقط وقتی کاربر دکمه «می‌خواهم» رو بزنه و پیام
-        # «رسیدم رو بده» رو بفرسته، از طریق receipt_handler ارسال میشه.
-
-        ACTIVE_WITHDRAW = None
-
-    except Exception as e:
-        print("❌ خطا:", e)
-        fail_active_withdraw()
-
-# ================= OLD WITHDRAW =================
-
-@client.on(events.NewMessage(chats=WITHDRAW_GROUP))
-async def old_withdraw_handler(event):
-    text = event.raw_text.strip()
-
-    if text not in ["میوهام رو بده", "میو هام رو بده"]:
-        return
-
-    user = await event.get_sender()
-
-    bal = get_balance(user.id)
-
-    if bal <= 0:
-        await event.reply("❌ موجودی میویی ندارید")
-        return
-
-    add_withdraw_queue(user.id, "", bal, "group", event.id)
-
-    await event.reply(
-        f"""
-
-⏳ درخواست برداشت ثبت شد ✅
-
-💎 مقدار:
-
-{bal:,} میو
-
-صف انتقال فعال شد.
-
-لطفاً منتظر بمانید.
-"""
+    wait_seconds = (
+        cooldown_remaining
+        + (position - 1) * delay_seconds
     )
 
-# ================= WITHDRAW BY ID =================
+    if wait_seconds > 0:
+        duration = format_queue_duration(wait_seconds)
 
-async def add_id_withdraw(user_id, target):
-    amount = get_balance(user_id)
+        wait_text = (
+            f"{queue_label}: حدود {duration} "
+            "تا نوبت شروع پردازش"
+        )
+    else:
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM withdraw_queue
+                WHERE status=1
+            ) AS processing
+        """)
 
-    if amount <= 0:
-        return False
+        processing = bool(cur.fetchone()["processing"])
 
-    add_withdraw_queue(user_id, target, amount, "id", 0)
+        if processing:
+            wait_text = "در انتظار پایان پردازش درخواست جاری"
+        else:
+            wait_text = "نوبت شما رسیده؛ در انتظار شروع پردازش"
 
-    return True
+    result.update({
+        "status": "pending",
+        "position": position,
+        "wait_seconds": wait_seconds,
+        "wait_text": wait_text,
+    })
 
-# ================= RECEIPT HANDLER =================
+    return result
 
-@client.on(events.NewMessage(incoming=True))
-async def receipt_handler(event):
-    if not event.is_private:
-        return
 
-    if event.raw_text.strip() != "رسیدم رو بده":
-        return
+def get_recent_notifications(cur, user_id):
+    cur.execute("""
+        SELECT id, amount, status, created_time
+        FROM withdraw_queue
+        WHERE user_id=%s AND status IN (2, 3, 4)
+        ORDER BY id DESC
+        LIMIT 10
+    """, (user_id,))
 
-    user = await event.get_sender()
+    notifications = []
 
-    db_execute(
-        """
-        SELECT request
-        FROM receipt_request
+    for row in cur.fetchall():
+        amount = int(row["amount"] or 0)
+        success = row["status"] == 2
+
+        notifications.append({
+            "id": f"withdraw:{row['id']}:{row['status']}",
+            "type": "success" if success else "fail",
+            "text": (
+                f"🎉 برداشت {amount:,} میو با موفقیت انجام شد."
+                if success
+                else f"❌ برداشت {amount:,} میو ناموفق بود."
+            ),
+            "time": to_iran_time_str(row["created_time"]),
+        })
+
+    return notifications
+
+
+# ================= GAME HELPERS =================
+
+def calculate_game_reward(symbols):
+    counts = Counter(symbols)
+
+    return sum(
+        GAME_PAYOUTS[symbol][counts[symbol]]
+        for symbol in GAME_SYMBOLS
+    )
+
+
+def public_round(row):
+    if not row:
+        return None
+
+    return {
+        "id": row["id"],
+        "request_id": str(row["request_id"]),
+        "symbols": row["symbols"],
+        "reward": int(row["reward"]),
+        "balance_after": int(row["balance_after"]),
+        "played_at": row["played_at"].timestamp(),
+        "next_play_at": row["next_play_at"].timestamp(),
+    }
+
+
+def get_game_state(cur, user_id, balance, now=None):
+    if now is None:
+        now = database_now(cur)
+
+    cur.execute("""
+        SELECT *
+        FROM mio_game_rounds
         WHERE user_id=%s
-        """,
-        (user.id,)
-    )
+        ORDER BY id DESC
+        LIMIT 1
+    """, (user_id,))
 
-    request = cursor.fetchone()
+    latest = cur.fetchone()
+    pending = get_pending_withdrawal(cur, user_id)
 
-    if not request or request[0] != 1:
-        await event.reply("❌ درخواست رسیدی ثبت نشده.")
-        return
+    remaining_seconds = 0
+    next_play_at = None
 
-    db_execute(
-        """
-        SELECT message_id, withdraw_type
-        FROM withdraw_receipts
-        WHERE user_id=%s
-        """,
-        (user.id,)
-    )
+    if latest:
+        next_play_at = latest["next_play_at"]
 
-    receipt = cursor.fetchone()
+        remaining_seconds = max(
+            0,
+            math.ceil((next_play_at - now).total_seconds()),
+        )
 
-    if not receipt:
-        await event.reply("❌ رسید پیدا نشد.")
-        return
+    return {
+        "enabled": GAME_ENABLED,
+        "can_play": (
+            GAME_ENABLED
+            and remaining_seconds == 0
+            and pending is None
+        ),
+        "withdrawal_pending": pending is not None,
+        "remaining_seconds": remaining_seconds,
+        "next_play_at": (
+            next_play_at.timestamp()
+            if next_play_at
+            else None
+        ),
+        "server_time": now.timestamp(),
+        "balance": int(balance),
+        "last_round": public_round(latest),
+        "payouts": GAME_PAYOUTS,
+    }
 
-    receipt_message_id, withdraw_type = receipt
 
-    # اگه برداشت از گپ بوده، رسید همونجا هست - فقط راهنمایی کن
-    if withdraw_type == "group":
-        await event.reply("برو تو گپ رسیدت هست 😐🤣")
-        return
+# ================= BASIC ROUTES =================
 
-    # برداشت با آیدی -> از ID_GROUP فوروارد کن
-    # برداشت با بانک میویی -> از WITHDRAW_GROUP فوروارد کن
-    source_chat = WITHDRAW_GROUP if withdraw_type == "card" else ID_GROUP
+@app.route("/")
+def health():
+    return jsonify({
+        "status": "ok",
+        "service": "mio-backend",
+    })
 
-    await client.forward_messages(user.id, receipt_message_id, source_chat)
 
-    db_execute(
-        """
-        UPDATE receipt_request
-        SET request=0
-        WHERE user_id=%s
-        """,
-        (user.id,)
-    )
+@app.route("/api/user")
+@authenticated
+def api_user(user):
+    with db_transaction() as cur:
+        row = get_user_row(cur, user["id"])
 
-    db.commit()
+        if not row:
+            return jsonify({
+                "balance": 0,
+                "daily_enabled": False,
+                "notifications": [],
+                "not_started": True,
+                "pending_withdrawal": None,
+            })
 
-    print(f"✅ رسید ارسال شد: {user.id}")
+        pending = get_pending_withdrawal(cur, user["id"])
 
-# ================= RUN =================
+        return jsonify({
+            "balance": user_balance(row),
+            "daily_enabled": row["daily_mio"] == 1,
+            "notifications": get_recent_notifications(
+                cur,
+                user["id"],
+            ),
+            "not_started": False,
+            "pending_withdrawal": (
+                withdrawal_payload(cur, pending)
+                if pending
+                else None
+            ),
+        })
 
-async def main():
-    print("Mio Userbot Started 🚀")
 
-    await client.start()
+@app.route("/api/invite-link")
+@authenticated
+def api_invite_link(user):
+    if not BOT_USERNAME:
+        return jsonify({
+            "ok": False,
+            "error": "bot_username_not_configured",
+        }), 500
 
-    print("✅ Userbot Online")
+    return jsonify({
+        "link": f"https://t.me/{BOT_USERNAME}?start={user['id']}"
+    })
 
-    await asyncio.gather(
-        client.run_until_disconnected(),
-        process_withdraw_queue()
-    )
+
+# ================= WITHDRAW =================
+
+def create_withdrawal(user, target, withdraw_type):
+    with db_transaction() as cur:
+        row = get_user_row(cur, user["id"], lock=True)
+
+        if not row:
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
+
+        pending = get_pending_withdrawal(cur, user["id"])
+
+        if pending:
+            result = withdrawal_payload(cur, pending)
+
+            result.update({
+                "ok": False,
+                "error": "already_pending",
+            })
+
+            return jsonify(result), 409
+
+        balance = user_balance(row)
+
+        if balance <= 0:
+            return jsonify({
+                "ok": False,
+                "error": "zero_balance",
+            }), 400
+
+        cur.execute("""
+            INSERT INTO withdraw_queue (
+                user_id,
+                target_username,
+                amount,
+                withdraw_type,
+                status,
+                created_time
+            )
+            VALUES (%s, %s, %s, %s, 0, %s)
+            RETURNING id, user_id, amount, status, withdraw_type
+        """, (
+            user["id"],
+            target,
+            balance,
+            withdraw_type,
+            time.time(),
+        ))
+
+        inserted = cur.fetchone()
+
+        result = withdrawal_payload(cur, inserted)
+        result["ok"] = True
+
+    return jsonify(result)
+
+
+@app.route("/api/withdraw", methods=["POST"])
+@authenticated
+def api_withdraw(user):
+    data = json_body()
+    target = data.get("target")
+
+    if not isinstance(target, str):
+        return jsonify({
+            "ok": False,
+            "error": "invalid_target",
+        }), 400
+
+    target = target.strip()
+
+    if not re.fullmatch(r"@[A-Za-z0-9_]{1,32}", target):
+        return jsonify({
+            "ok": False,
+            "error": "invalid_target",
+        }), 400
+
+    return create_withdrawal(user, target, "id")
+
+
+@app.route("/api/withdraw-bank", methods=["POST"])
+@authenticated
+def api_withdraw_bank(user):
+    data = json_body()
+    card = data.get("card")
+
+    if not isinstance(card, str):
+        return jsonify({
+            "ok": False,
+            "error": "invalid_card",
+        }), 400
+
+    card = card.strip()
+
+    if not re.fullmatch(r"[0-9]{10,20}", card):
+        return jsonify({
+            "ok": False,
+            "error": "invalid_card",
+        }), 400
+
+    return create_withdrawal(user, card, "card")
+
+
+@app.route("/api/withdraw-status")
+@authenticated
+def api_withdraw_status(user):
+    withdraw_id = request.args.get("withdraw_id")
+
+    if withdraw_id is not None:
+        if not re.fullmatch(r"[0-9]{1,18}", withdraw_id):
+            return jsonify({
+                "ok": False,
+                "error": "invalid_withdraw_id",
+            }), 400
+
+        withdraw_id = int(withdraw_id)
+
+    with db_transaction() as cur:
+        if withdraw_id is None:
+            cur.execute("""
+                SELECT id, user_id, amount, status, withdraw_type
+                FROM withdraw_queue
+                WHERE user_id=%s
+                ORDER BY id DESC
+                LIMIT 1
+            """, (user["id"],))
+        else:
+            cur.execute("""
+                SELECT id, user_id, amount, status, withdraw_type
+                FROM withdraw_queue
+                WHERE user_id=%s AND id=%s
+            """, (user["id"], withdraw_id))
+
+        return jsonify(
+            withdrawal_payload(cur, cur.fetchone())
+        )
+
+
+@app.route("/api/receipt", methods=["POST"])
+@authenticated
+def api_receipt(user):
+    with db_transaction() as cur:
+        cur.execute("""
+            INSERT INTO receipt_request (user_id, request)
+            VALUES (%s, 1)
+            ON CONFLICT (user_id)
+            DO UPDATE SET request=EXCLUDED.request
+        """, (user["id"],))
+
+    return jsonify({"ok": True})
+
+
+# ================= DAILY =================
+
+@app.route("/api/daily/enable", methods=["POST"])
+@authenticated
+def api_daily_enable(user):
+    with db_transaction() as cur:
+        row = get_user_row(cur, user["id"], lock=True)
+
+        if not row:
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
+
+        current_balance = user_balance(row)
+
+        if row["daily_mio"] == 1:
+            return jsonify({
+                "ok": True,
+                "balance": current_balance,
+            })
+
+        if get_pending_withdrawal(cur, user["id"]):
+            return jsonify({
+                "ok": False,
+                "error": "withdrawal_pending",
+            }), 409
+
+        # موجودی بالاتر از سقف، کم نمی‌شود.
+        daily_credit = max(
+            0,
+            min(
+                DAILY_AMOUNT,
+                DAILY_BALANCE_CAP - current_balance,
+            ),
+        )
+
+        cur.execute("""
+            UPDATE users
+            SET
+                daily_mio=1,
+                balance=COALESCE(balance, 0) + %s
+            WHERE user_id=%s
+            RETURNING balance
+        """, (
+            daily_credit,
+            user["id"],
+        ))
+
+        balance = int(cur.fetchone()["balance"])
+
+    return jsonify({
+        "ok": True,
+        "balance": balance,
+    })
+
+
+# ================= GAME STATUS =================
+
+@app.route("/api/game/status")
+@authenticated
+def api_game_status(user):
+    with db_transaction() as cur:
+        row = get_user_row(cur, user["id"], lock=True)
+
+        if not row:
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
+
+        result = get_game_state(
+            cur,
+            user["id"],
+            user_balance(row),
+        )
+
+        result["ok"] = True
+
+    return jsonify(result)
+
+
+# ================= GAME PLAY =================
+
+@app.route("/api/game/play", methods=["POST"])
+@authenticated
+def api_game_play(user):
+    data = json_body()
+
+    try:
+        request_id = str(
+            uuid.UUID(str(data.get("request_id", "")))
+        )
+    except (ValueError, TypeError, AttributeError):
+        return jsonify({
+            "ok": False,
+            "error": "invalid_request_id",
+        }), 400
+
+    with db_transaction() as cur:
+        row = get_user_row(cur, user["id"], lock=True)
+
+        if not row:
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
+
+        balance = user_balance(row)
+
+        # بازیابی همان نتیجه در درخواست تکراری.
+        cur.execute("""
+            SELECT *
+            FROM mio_game_rounds
+            WHERE user_id=%s AND request_id=%s
+        """, (
+            user["id"],
+            request_id,
+        ))
+
+        previous_round = cur.fetchone()
+
+        if previous_round:
+            result = get_game_state(
+                cur,
+                user["id"],
+                balance,
+            )
+
+            result.update({
+                "ok": True,
+                "replayed": True,
+                "round": public_round(previous_round),
+            })
+
+            return jsonify(result)
+
+        now = database_now(cur)
+
+        game_state = get_game_state(
+            cur,
+            user["id"],
+            balance,
+            now=now,
+        )
+
+        if not GAME_ENABLED:
+            return jsonify({
+                **game_state,
+                "ok": False,
+                "error": "game_disabled",
+            }), 403
+
+        if game_state["withdrawal_pending"]:
+            return jsonify({
+                **game_state,
+                "ok": False,
+                "error": "withdrawal_pending",
+            }), 409
+
+        if game_state["remaining_seconds"] > 0:
+            return jsonify({
+                **game_state,
+                "ok": False,
+                "error": "cooldown",
+            }), 429
+
+        symbols = [
+            secrets.choice(GAME_SYMBOLS)
+            for _ in range(3)
+        ]
+
+        reward = calculate_game_reward(symbols)
+        next_play_at = now + GAME_COOLDOWN
+
+        cur.execute("""
+            UPDATE users
+            SET balance=COALESCE(balance, 0) + %s
+            WHERE user_id=%s
+            RETURNING balance
+        """, (
+            reward,
+            user["id"],
+        ))
+
+        new_balance = int(cur.fetchone()["balance"])
+
+        cur.execute("""
+            INSERT INTO mio_game_rounds (
+                user_id,
+                request_id,
+                symbols,
+                reward,
+                balance_after,
+                played_at,
+                next_play_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (
+            user["id"],
+            request_id,
+            Json(symbols),
+            reward,
+            new_balance,
+            now,
+            next_play_at,
+        ))
+
+        round_row = cur.fetchone()
+
+        result = get_game_state(
+            cur,
+            user["id"],
+            new_balance,
+            now=now,
+        )
+
+        result.update({
+            "ok": True,
+            "replayed": False,
+            "round": public_round(round_row),
+        })
+
+    return jsonify(result)
+
+
+# ================= STARTUP =================
+
+init_database()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+)
