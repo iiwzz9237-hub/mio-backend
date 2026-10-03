@@ -46,6 +46,9 @@ IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 DAILY_AMOUNT = 340000
 DAILY_BALANCE_CAP = 500000
 
+NORMAL_TRANSFER_DELAY = 35
+BANK_TRANSFER_DELAY = 240
+
 GAME_COOLDOWN = timedelta(hours=48)
 
 GAME_SYMBOLS = ("seven", "grape", "lemon", "blank")
@@ -62,10 +65,6 @@ GAME_PAYOUTS = {
 
 @contextmanager
 def db_transaction():
-    """
-    هر عملیات اتصال و تراکنش مستقل دارد.
-    هیچ cursor یا connection مشترکی بین درخواست‌ها استفاده نمی‌شود.
-    """
     connection = psycopg2.connect(
         DATABASE_URL,
         connect_timeout=10,
@@ -81,13 +80,8 @@ def db_transaction():
         connection.close()
 
 
-def init_game_database():
-    """
-    فقط جدول و ایندکس جدید بازی ساخته می‌شود.
-    جدول users و ساختار صف برداشت تغییر نمی‌کنند.
-    """
+def init_database():
     with db_transaction() as cur:
-        # جلوگیری از اجرای هم‌زمان ساخت جدول در چند worker
         cur.execute(
             "SELECT pg_advisory_xact_lock(%s)",
             (748219306,),
@@ -114,10 +108,38 @@ def init_game_database():
             ON mio_game_rounds (user_id, id DESC)
         """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS withdraw_transfer_limits (
+                method TEXT PRIMARY KEY,
+                delay_seconds INTEGER NOT NULL
+                    CHECK (delay_seconds > 0),
+                next_allowed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+                updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+            )
+        """)
+
+        # سرور زمان ذخیره‌شده توسط یوزربات را بازنشانی نمی‌کند.
+        cur.execute("""
+            INSERT INTO withdraw_transfer_limits (
+                method,
+                delay_seconds,
+                next_allowed_at,
+                updated_at
+            )
+            VALUES
+                ('normal', %s, 0, 0),
+                ('card', %s, 0, 0)
+            ON CONFLICT (method) DO NOTHING
+        """, (
+            NORMAL_TRANSFER_DELAY,
+            BANK_TRANSFER_DELAY,
+        ))
+
 
 @app.errorhandler(psycopg2.Error)
 def database_error(error):
     app.logger.exception("Database operation failed")
+
     return jsonify({
         "ok": False,
         "error": "database_unavailable",
@@ -139,7 +161,6 @@ def verify_init_data(init_data):
 
         pairs = dict(items)
 
-        # جلوگیری از پارامترهای تکراری
         if len(items) != len(pairs):
             return None
 
@@ -240,7 +261,7 @@ def json_body():
     return data if isinstance(data, dict) else {}
 
 
-# ================= HELPERS =================
+# ================= USER / TIME HELPERS =================
 
 def database_now(cur):
     cur.execute("SELECT clock_timestamp() AS now")
@@ -277,6 +298,8 @@ def to_iran_time_str(timestamp):
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
+# ================= WITHDRAW QUEUE HELPERS =================
+
 def get_pending_withdrawal(cur, user_id):
     cur.execute("""
         SELECT id, user_id, amount, status, withdraw_type
@@ -289,20 +312,24 @@ def get_pending_withdrawal(cur, user_id):
     return cur.fetchone()
 
 
-def get_wait_text(position):
-    if position <= 1:
-        return "در حال آماده‌سازی واریز"
+def format_queue_duration(seconds):
+    seconds = max(0, int(seconds))
 
-    seconds = (position - 1) * 35
-    minutes, seconds = divmod(seconds, 60)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
 
-    if minutes and seconds:
-        return f"{minutes} دقیقه و {seconds} ثانیه تا واریز"
+    parts = []
+
+    if hours:
+        parts.append(f"{hours} ساعت")
 
     if minutes:
-        return f"{minutes} دقیقه تا واریز"
+        parts.append(f"{minutes} دقیقه")
 
-    return f"{seconds} ثانیه تا واریز"
+    if seconds:
+        parts.append(f"{seconds} ثانیه")
+
+    return " و ".join(parts) if parts else "چند لحظه"
 
 
 def withdrawal_payload(cur, row):
@@ -310,40 +337,127 @@ def withdrawal_payload(cur, row):
         return {"status": "none"}
 
     status_code = row["status"]
+    is_bank = row["withdraw_type"] == "card"
+
+    method = "card" if is_bank else "normal"
+    queue_label = "بانک میویی" if is_bank else "انتقال میویی"
 
     result = {
         "withdraw_id": row["id"],
         "amount": int(row["amount"] or 0),
         "withdraw_type": row["withdraw_type"],
+        "queue_type": method,
     }
 
-    if status_code in (0, 1):
-        position = 0
+    if status_code == 2:
+        result["status"] = "success"
+        return result
 
-        if status_code == 0:
-            cur.execute("""
-                SELECT COUNT(*) AS position
-                FROM withdraw_queue
-                WHERE status=0 AND id <= %s
-            """, (row["id"],))
+    if status_code not in (0, 1):
+        result["status"] = "failed"
+        return result
 
-            position = int(cur.fetchone()["position"])
-
+    if status_code == 1:
         result.update({
             "status": "pending",
-            "position": position,
+            "position": 0,
+            "wait_seconds": 0,
             "wait_text": (
-                "در حال پردازش برداشت"
-                if status_code == 1
-                else get_wait_text(position)
+                "در حال انجام مراحل بانک میویی"
+                if is_bank
+                else "در حال پردازش انتقال"
             ),
         })
 
-    elif status_code == 2:
-        result["status"] = "success"
+        return result
 
+    # جایگاه کاربر در صف روش برداشت خودش.
+    # برداشت بانکی از برداشت آیدی/گپی جدا محاسبه می‌شود.
+    cur.execute("""
+        SELECT COUNT(*) AS position
+        FROM withdraw_queue
+        WHERE
+            status=0
+            AND id <= %s
+            AND (
+                CASE
+                    WHEN withdraw_type='card' THEN 'card'
+                    ELSE 'normal'
+                END
+            ) = %s
+    """, (row["id"], method))
+
+    position = max(
+        1,
+        int(cur.fetchone()["position"]),
+    )
+
+    # همان زمان ثبت‌شده توسط یوزربات.
+    cur.execute("""
+        SELECT
+            delay_seconds,
+            next_allowed_at,
+            EXTRACT(EPOCH FROM clock_timestamp())::double precision
+                AS server_now
+        FROM withdraw_transfer_limits
+        WHERE method=%s
+    """, (method,))
+
+    limit_row = cur.fetchone()
+
+    if limit_row:
+        delay_seconds = int(limit_row["delay_seconds"])
+
+        cooldown_remaining = max(
+            0,
+            math.ceil(
+                float(limit_row["next_allowed_at"])
+                - float(limit_row["server_now"])
+            ),
+        )
     else:
-        result["status"] = "failed"
+        delay_seconds = (
+            BANK_TRANSFER_DELAY
+            if is_bank
+            else NORMAL_TRANSFER_DELAY
+        )
+
+        cooldown_remaining = 0
+
+    wait_seconds = (
+        cooldown_remaining
+        + (position - 1) * delay_seconds
+    )
+
+    if wait_seconds > 0:
+        duration = format_queue_duration(wait_seconds)
+
+        wait_text = (
+            f"{queue_label}: حدود {duration} "
+            "تا نوبت شروع پردازش"
+        )
+    else:
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM withdraw_queue
+                WHERE status=1
+            ) AS processing
+        """)
+
+        processing = bool(cur.fetchone()["processing"])
+
+        if processing:
+            wait_text = "در انتظار پایان پردازش درخواست جاری"
+        else:
+            wait_text = "نوبت شما رسیده؛ در انتظار شروع پردازش"
+
+    result.update({
+        "status": "pending",
+        "position": position,
+        "wait_seconds": wait_seconds,
+        "wait_text": wait_text,
+    })
 
     return result
 
@@ -511,7 +625,6 @@ def api_invite_link(user):
 
 def create_withdrawal(user, target, withdraw_type):
     with db_transaction() as cur:
-        # همان قفل ردیفی که بازی هم استفاده می‌کند.
         row = get_user_row(cur, user["id"], lock=True)
 
         if not row:
@@ -524,6 +637,7 @@ def create_withdrawal(user, target, withdraw_type):
 
         if pending:
             result = withdrawal_payload(cur, pending)
+
             result.update({
                 "ok": False,
                 "error": "already_pending",
@@ -559,6 +673,7 @@ def create_withdrawal(user, target, withdraw_type):
         ))
 
         inserted = cur.fetchone()
+
         result = withdrawal_payload(cur, inserted)
         result["ok"] = True
 
@@ -591,10 +706,6 @@ def api_withdraw(user):
 @app.route("/api/withdraw-bank", methods=["POST"])
 @authenticated
 def api_withdraw_bank(user):
-    """
-    این مسیر درخواست را در صف ثبت می‌کند.
-    پرداخت واقعی کارت باید در پردازشگر بات پیاده‌سازی شده باشد.
-    """
     data = json_body()
     card = data.get("card")
 
@@ -638,7 +749,6 @@ def api_withdraw_status(user):
                 ORDER BY id DESC
                 LIMIT 1
             """, (user["id"],))
-
         else:
             cur.execute("""
                 SELECT id, user_id, amount, status, withdraw_type
@@ -687,15 +797,13 @@ def api_daily_enable(user):
                 "balance": current_balance,
             })
 
-        # تا مشخص‌شدن روش کسر موجودی در worker،
-        # هنگام برداشت معلق موجودی جدید اضافه نمی‌کنیم.
         if get_pending_withdrawal(cur, user["id"]):
             return jsonify({
                 "ok": False,
                 "error": "withdrawal_pending",
             }), 409
 
-        # سقف روزانه حفظ می‌شود، ولی موجودی بالاتر کاهش پیدا نمی‌کند.
+        # موجودی بالاتر از سقف، کم نمی‌شود.
         daily_credit = max(
             0,
             min(
@@ -711,7 +819,10 @@ def api_daily_enable(user):
                 balance=COALESCE(balance, 0) + %s
             WHERE user_id=%s
             RETURNING balance
-        """, (daily_credit, user["id"]))
+        """, (
+            daily_credit,
+            user["id"],
+        ))
 
         balance = int(cur.fetchone()["balance"])
 
@@ -754,7 +865,9 @@ def api_game_play(user):
     data = json_body()
 
     try:
-        request_id = str(uuid.UUID(str(data.get("request_id", ""))))
+        request_id = str(
+            uuid.UUID(str(data.get("request_id", "")))
+        )
     except (ValueError, TypeError, AttributeError):
         return jsonify({
             "ok": False,
@@ -762,7 +875,6 @@ def api_game_play(user):
         }), 400
 
     with db_transaction() as cur:
-        # تمام درخواست‌های بازی این کاربر پشت این قفل قرار می‌گیرند.
         row = get_user_row(cur, user["id"], lock=True)
 
         if not row:
@@ -773,13 +885,15 @@ def api_game_play(user):
 
         balance = user_balance(row)
 
-        # اگر پاسخ قبلی گم شده باشد، همان نتیجه بازگردانده می‌شود.
-        # هیچ جایزه‌ای دوباره واریز نمی‌شود.
+        # بازیابی همان نتیجه در درخواست تکراری.
         cur.execute("""
             SELECT *
             FROM mio_game_rounds
             WHERE user_id=%s AND request_id=%s
-        """, (user["id"], request_id))
+        """, (
+            user["id"],
+            request_id,
+        ))
 
         previous_round = cur.fetchone()
 
@@ -828,7 +942,6 @@ def api_game_play(user):
                 "error": "cooldown",
             }), 429
 
-        # قرعه‌کشی واقعی فقط در سرور انجام می‌شود.
         symbols = [
             secrets.choice(GAME_SYMBOLS)
             for _ in range(3)
@@ -837,13 +950,15 @@ def api_game_play(user):
         reward = calculate_game_reward(symbols)
         next_play_at = now + GAME_COOLDOWN
 
-        # جایزه به همان موجودی اصلی قابل برداشت اضافه می‌شود.
         cur.execute("""
             UPDATE users
             SET balance=COALESCE(balance, 0) + %s
             WHERE user_id=%s
             RETURNING balance
-        """, (reward, user["id"]))
+        """, (
+            reward,
+            user["id"],
+        ))
 
         new_balance = int(cur.fetchone()["balance"])
 
@@ -884,18 +999,15 @@ def api_game_play(user):
             "round": public_round(round_row),
         })
 
-        # خروج موفق از این بلوک، موجودی و نتیجه را با هم commit می‌کند.
-        # در خطا هر دو rollback می‌شوند.
-
     return jsonify(result)
 
 
 # ================= STARTUP =================
 
-init_game_database()
+init_database()
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
-            )
+    )
