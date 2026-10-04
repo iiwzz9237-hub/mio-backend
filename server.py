@@ -47,10 +47,9 @@ DAILY_AMOUNT = 340000
 DAILY_BALANCE_CAP = 500000
 
 NORMAL_TRANSFER_DELAY = 35
-BANK_TRANSFER_DELAY = 240
+BANK_TRANSFER_DELAY = 300
 
 GAME_COOLDOWN = timedelta(hours=48)
-
 GAME_SYMBOLS = ("seven", "grape", "lemon", "blank")
 
 GAME_PAYOUTS = {
@@ -88,6 +87,32 @@ def init_database():
         )
 
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS withdraw_queue (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                target_username TEXT,
+                amount BIGINT,
+                withdraw_type TEXT,
+                status INTEGER DEFAULT 0,
+                created_time DOUBLE PRECISION,
+                message_id BIGINT,
+                completed_time DOUBLE PRECISION
+            )
+        """)
+
+        cur.execute("""
+            ALTER TABLE withdraw_queue
+            ADD COLUMN IF NOT EXISTS completed_time DOUBLE PRECISION
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS receipt_request (
+                user_id BIGINT PRIMARY KEY,
+                request INTEGER DEFAULT 0
+            )
+        """)
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS mio_game_rounds (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
@@ -109,6 +134,13 @@ def init_database():
         """)
 
         cur.execute("""
+            CREATE INDEX IF NOT EXISTS
+                withdraw_queue_user_completed_idx
+            ON withdraw_queue (user_id, completed_time)
+            WHERE status=2
+        """)
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS withdraw_transfer_limits (
                 method TEXT PRIMARY KEY,
                 delay_seconds INTEGER NOT NULL
@@ -118,22 +150,33 @@ def init_database():
             )
         """)
 
-        # سرور زمان ذخیره‌شده توسط یوزربات را بازنشانی نمی‌کند.
-        cur.execute("""
-            INSERT INTO withdraw_transfer_limits (
-                method,
-                delay_seconds,
-                next_allowed_at,
-                updated_at
-            )
-            VALUES
-                ('normal', %s, 0, 0),
-                ('card', %s, 0, 0)
-            ON CONFLICT (method) DO NOTHING
-        """, (
-            NORMAL_TRANSFER_DELAY,
-            BANK_TRANSFER_DELAY,
-        ))
+        # محدودیت قبلی ۲۴۰ ثانیه‌ای نیز از زمان آخرین عملیات
+        # به ۳۰۰ ثانیه ارتقا پیدا می‌کند.
+        for method, delay in (
+            ("normal", NORMAL_TRANSFER_DELAY),
+            ("card", BANK_TRANSFER_DELAY),
+        ):
+            cur.execute("""
+                INSERT INTO withdraw_transfer_limits (
+                    method,
+                    delay_seconds,
+                    next_allowed_at,
+                    updated_at
+                )
+                VALUES (%s, %s, 0, 0)
+                ON CONFLICT (method)
+                DO UPDATE SET
+                    delay_seconds=EXCLUDED.delay_seconds,
+                    next_allowed_at=GREATEST(
+                        withdraw_transfer_limits.next_allowed_at,
+                        CASE
+                            WHEN withdraw_transfer_limits.updated_at > 0
+                            THEN withdraw_transfer_limits.updated_at
+                                + EXCLUDED.delay_seconds
+                            ELSE 0
+                        END
+                    )
+            """, (method, delay))
 
 
 @app.errorhandler(psycopg2.Error)
@@ -201,10 +244,7 @@ def verify_init_data(init_data):
         if auth_date <= 0:
             return None
 
-        if now - auth_date > 86400:
-            return None
-
-        if auth_date > now + 30:
+        if now - auth_date > 86400 or auth_date > now + 30:
             return None
 
         user = json.loads(pairs.get("user", ""))
@@ -261,7 +301,7 @@ def json_body():
     return data if isinstance(data, dict) else {}
 
 
-# ================= USER / TIME HELPERS =================
+# ================= HELPERS =================
 
 def database_now(cur):
     cur.execute("SELECT clock_timestamp() AS now")
@@ -290,31 +330,14 @@ def to_iran_time_str(timestamp):
     if not timestamp:
         return ""
 
-    dt = datetime.fromtimestamp(
+    return datetime.fromtimestamp(
         float(timestamp),
         tz=IRAN_TZ,
-    )
-
-    return dt.strftime("%Y-%m-%d %H:%M")
-
-
-# ================= WITHDRAW QUEUE HELPERS =================
-
-def get_pending_withdrawal(cur, user_id):
-    cur.execute("""
-        SELECT id, user_id, amount, status, withdraw_type
-        FROM withdraw_queue
-        WHERE user_id=%s AND status IN (0, 1)
-        ORDER BY id DESC
-        LIMIT 1
-    """, (user_id,))
-
-    return cur.fetchone()
+    ).strftime("%Y-%m-%d %H:%M")
 
 
 def format_queue_duration(seconds):
     seconds = max(0, int(seconds))
-
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
 
@@ -322,14 +345,42 @@ def format_queue_duration(seconds):
 
     if hours:
         parts.append(f"{hours} ساعت")
-
     if minutes:
         parts.append(f"{minutes} دقیقه")
-
     if seconds:
         parts.append(f"{seconds} ثانیه")
 
     return " و ".join(parts) if parts else "چند لحظه"
+
+
+# ================= QUEUE =================
+
+def get_pending_withdrawal(cur, user_id):
+    cur.execute("""
+        SELECT id, user_id, amount, status, withdraw_type
+        FROM withdraw_queue
+        WHERE user_id=%s AND status IN (0, 1)
+        ORDER BY id ASC
+        LIMIT 1
+    """, (user_id,))
+
+    return cur.fetchone()
+
+
+def get_pending_withdrawals(cur, user_id):
+    cur.execute("""
+        SELECT id, user_id, amount, status, withdraw_type
+        FROM withdraw_queue
+        WHERE user_id=%s AND status IN (0, 1)
+        ORDER BY id ASC
+    """, (user_id,))
+
+    rows = cur.fetchall()
+
+    return [
+        withdrawal_payload(cur, row)
+        for row in rows
+    ]
 
 
 def withdrawal_payload(cur, row):
@@ -338,15 +389,14 @@ def withdrawal_payload(cur, row):
 
     status_code = row["status"]
     is_bank = row["withdraw_type"] == "card"
-
     method = "card" if is_bank else "normal"
-    queue_label = "بانک میویی" if is_bank else "انتقال میویی"
 
     result = {
         "withdraw_id": row["id"],
         "amount": int(row["amount"] or 0),
         "withdraw_type": row["withdraw_type"],
         "queue_type": method,
+        "processing": status_code == 1,
     }
 
     if status_code == 2:
@@ -371,8 +421,6 @@ def withdrawal_payload(cur, row):
 
         return result
 
-    # جایگاه کاربر در صف روش برداشت خودش.
-    # برداشت بانکی از برداشت آیدی/گپی جدا محاسبه می‌شود.
     cur.execute("""
         SELECT COUNT(*) AS position
         FROM withdraw_queue
@@ -387,41 +435,48 @@ def withdrawal_payload(cur, row):
             ) = %s
     """, (row["id"], method))
 
-    position = max(
-        1,
-        int(cur.fetchone()["position"]),
-    )
+    position = max(1, int(cur.fetchone()["position"]))
 
-    # همان زمان ثبت‌شده توسط یوزربات.
     cur.execute("""
         SELECT
+            method,
             delay_seconds,
             next_allowed_at,
             EXTRACT(EPOCH FROM clock_timestamp())::double precision
                 AS server_now
         FROM withdraw_transfer_limits
-        WHERE method=%s
-    """, (method,))
+        WHERE method IN ('normal', 'card')
+    """)
 
-    limit_row = cur.fetchone()
+    limits = {
+        item["method"]: item
+        for item in cur.fetchall()
+    }
 
-    if limit_row:
-        delay_seconds = int(limit_row["delay_seconds"])
+    own_limit = limits.get(method)
+    normal_limit = limits.get("normal")
+
+    delay_seconds = (
+        int(own_limit["delay_seconds"])
+        if own_limit
+        else BANK_TRANSFER_DELAY if is_bank else NORMAL_TRANSFER_DELAY
+    )
+
+    if own_limit:
+        ready_at = float(own_limit["next_allowed_at"])
+
+        # فاصلهٔ عمومی کوتاه عملیات نیز لحاظ می‌شود.
+        if is_bank and normal_limit:
+            ready_at = max(
+                ready_at,
+                float(normal_limit["next_allowed_at"]),
+            )
 
         cooldown_remaining = max(
             0,
-            math.ceil(
-                float(limit_row["next_allowed_at"])
-                - float(limit_row["server_now"])
-            ),
+            math.ceil(ready_at - float(own_limit["server_now"])),
         )
     else:
-        delay_seconds = (
-            BANK_TRANSFER_DELAY
-            if is_bank
-            else NORMAL_TRANSFER_DELAY
-        )
-
         cooldown_remaining = 0
 
     wait_seconds = (
@@ -430,10 +485,11 @@ def withdrawal_payload(cur, row):
     )
 
     if wait_seconds > 0:
-        duration = format_queue_duration(wait_seconds)
+        label = "بانک میویی" if is_bank else "انتقال میویی"
 
         wait_text = (
-            f"{queue_label}: حدود {duration} "
+            f"{label}: حدود "
+            f"{format_queue_duration(wait_seconds)} "
             "تا نوبت شروع پردازش"
         )
     else:
@@ -445,9 +501,7 @@ def withdrawal_payload(cur, row):
             ) AS processing
         """)
 
-        processing = bool(cur.fetchone()["processing"])
-
-        if processing:
+        if cur.fetchone()["processing"]:
             wait_text = "در انتظار پایان پردازش درخواست جاری"
         else:
             wait_text = "نوبت شما رسیده؛ در انتظار شروع پردازش"
@@ -462,12 +516,42 @@ def withdrawal_payload(cur, row):
     return result
 
 
+# ================= DAILY WITHDRAW TOTAL / NOTIFICATIONS =================
+
+def get_withdrawn_today(cur, user_id):
+    now = database_now(cur).astimezone(IRAN_TZ)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0) AS total
+        FROM withdraw_queue
+        WHERE
+            user_id=%s
+            AND status=2
+            AND completed_time >= %s
+            AND completed_time < %s
+    """, (
+        user_id,
+        day_start.timestamp(),
+        day_end.timestamp(),
+    ))
+
+    return int(cur.fetchone()["total"])
+
+
 def get_recent_notifications(cur, user_id):
     cur.execute("""
-        SELECT id, amount, status, created_time
+        SELECT
+            id,
+            amount,
+            status,
+            COALESCE(completed_time, created_time) AS event_time
         FROM withdraw_queue
         WHERE user_id=%s AND status IN (2, 3, 4)
-        ORDER BY id DESC
+        ORDER BY
+            COALESCE(completed_time, created_time) DESC NULLS LAST,
+            id DESC
         LIMIT 10
     """, (user_id,))
 
@@ -481,17 +565,17 @@ def get_recent_notifications(cur, user_id):
             "id": f"withdraw:{row['id']}:{row['status']}",
             "type": "success" if success else "fail",
             "text": (
-                f"🎉 برداشت {amount:,} میو با موفقیت انجام شد."
+                f"🎉 برداشت {amount:,} میو با موفقیت ثبت شد."
                 if success
                 else f"❌ برداشت {amount:,} میو ناموفق بود."
             ),
-            "time": to_iran_time_str(row["created_time"]),
+            "time": to_iran_time_str(row["event_time"]),
         })
 
     return notifications
 
 
-# ================= GAME HELPERS =================
+# ================= GAME =================
 
 def calculate_game_reward(symbols):
     counts = Counter(symbols)
@@ -537,7 +621,6 @@ def get_game_state(cur, user_id, balance, now=None):
 
     if latest:
         next_play_at = latest["next_play_at"]
-
         remaining_seconds = max(
             0,
             math.ceil((next_play_at - now).total_seconds()),
@@ -564,7 +647,7 @@ def get_game_state(cur, user_id, balance, now=None):
     }
 
 
-# ================= BASIC ROUTES =================
+# ================= ROUTES =================
 
 @app.route("/")
 def health():
@@ -586,24 +669,21 @@ def api_user(user):
                 "daily_enabled": False,
                 "notifications": [],
                 "not_started": True,
+                "withdrawn_today": 0,
                 "pending_withdrawal": None,
+                "pending_withdrawals": [],
             })
 
-        pending = get_pending_withdrawal(cur, user["id"])
+        pending = get_pending_withdrawals(cur, user["id"])
 
         return jsonify({
             "balance": user_balance(row),
             "daily_enabled": row["daily_mio"] == 1,
-            "notifications": get_recent_notifications(
-                cur,
-                user["id"],
-            ),
+            "notifications": get_recent_notifications(cur, user["id"]),
             "not_started": False,
-            "pending_withdrawal": (
-                withdrawal_payload(cur, pending)
-                if pending
-                else None
-            ),
+            "withdrawn_today": get_withdrawn_today(cur, user["id"]),
+            "pending_withdrawal": pending[0] if pending else None,
+            "pending_withdrawals": pending,
         })
 
 
@@ -621,8 +701,6 @@ def api_invite_link(user):
     })
 
 
-# ================= WITHDRAW =================
-
 def create_withdrawal(user, target, withdraw_type):
     with db_transaction() as cur:
         row = get_user_row(cur, user["id"], lock=True)
@@ -637,7 +715,6 @@ def create_withdrawal(user, target, withdraw_type):
 
         if pending:
             result = withdrawal_payload(cur, pending)
-
             result.update({
                 "ok": False,
                 "error": "already_pending",
@@ -672,9 +749,7 @@ def create_withdrawal(user, target, withdraw_type):
             time.time(),
         ))
 
-        inserted = cur.fetchone()
-
-        result = withdrawal_payload(cur, inserted)
+        result = withdrawal_payload(cur, cur.fetchone())
         result["ok"] = True
 
     return jsonify(result)
@@ -683,22 +758,15 @@ def create_withdrawal(user, target, withdraw_type):
 @app.route("/api/withdraw", methods=["POST"])
 @authenticated
 def api_withdraw(user):
-    data = json_body()
-    target = data.get("target")
+    target = json_body().get("target")
 
     if not isinstance(target, str):
-        return jsonify({
-            "ok": False,
-            "error": "invalid_target",
-        }), 400
+        return jsonify({"ok": False, "error": "invalid_target"}), 400
 
     target = target.strip()
 
     if not re.fullmatch(r"@[A-Za-z0-9_]{1,32}", target):
-        return jsonify({
-            "ok": False,
-            "error": "invalid_target",
-        }), 400
+        return jsonify({"ok": False, "error": "invalid_target"}), 400
 
     return create_withdrawal(user, target, "id")
 
@@ -706,22 +774,15 @@ def api_withdraw(user):
 @app.route("/api/withdraw-bank", methods=["POST"])
 @authenticated
 def api_withdraw_bank(user):
-    data = json_body()
-    card = data.get("card")
+    card = json_body().get("card")
 
     if not isinstance(card, str):
-        return jsonify({
-            "ok": False,
-            "error": "invalid_card",
-        }), 400
+        return jsonify({"ok": False, "error": "invalid_card"}), 400
 
     card = card.strip()
 
     if not re.fullmatch(r"[0-9]{10,20}", card):
-        return jsonify({
-            "ok": False,
-            "error": "invalid_card",
-        }), 400
+        return jsonify({"ok": False, "error": "invalid_card"}), 400
 
     return create_withdrawal(user, card, "card")
 
@@ -775,8 +836,6 @@ def api_receipt(user):
     return jsonify({"ok": True})
 
 
-# ================= DAILY =================
-
 @app.route("/api/daily/enable", methods=["POST"])
 @authenticated
 def api_daily_enable(user):
@@ -784,10 +843,7 @@ def api_daily_enable(user):
         row = get_user_row(cur, user["id"], lock=True)
 
         if not row:
-            return jsonify({
-                "ok": False,
-                "error": "not_started",
-            }), 403
+            return jsonify({"ok": False, "error": "not_started"}), 403
 
         current_balance = user_balance(row)
 
@@ -803,13 +859,9 @@ def api_daily_enable(user):
                 "error": "withdrawal_pending",
             }), 409
 
-        # موجودی بالاتر از سقف، کم نمی‌شود.
         daily_credit = max(
             0,
-            min(
-                DAILY_AMOUNT,
-                DAILY_BALANCE_CAP - current_balance,
-            ),
+            min(DAILY_AMOUNT, DAILY_BALANCE_CAP - current_balance),
         )
 
         cur.execute("""
@@ -819,20 +871,12 @@ def api_daily_enable(user):
                 balance=COALESCE(balance, 0) + %s
             WHERE user_id=%s
             RETURNING balance
-        """, (
-            daily_credit,
-            user["id"],
-        ))
+        """, (daily_credit, user["id"]))
 
         balance = int(cur.fetchone()["balance"])
 
-    return jsonify({
-        "ok": True,
-        "balance": balance,
-    })
+    return jsonify({"ok": True, "balance": balance})
 
-
-# ================= GAME STATUS =================
 
 @app.route("/api/game/status")
 @authenticated
@@ -841,23 +885,17 @@ def api_game_status(user):
         row = get_user_row(cur, user["id"], lock=True)
 
         if not row:
-            return jsonify({
-                "ok": False,
-                "error": "not_started",
-            }), 403
+            return jsonify({"ok": False, "error": "not_started"}), 403
 
         result = get_game_state(
             cur,
             user["id"],
             user_balance(row),
         )
-
         result["ok"] = True
 
     return jsonify(result)
 
-
-# ================= GAME PLAY =================
 
 @app.route("/api/game/play", methods=["POST"])
 @authenticated
@@ -865,9 +903,7 @@ def api_game_play(user):
     data = json_body()
 
     try:
-        request_id = str(
-            uuid.UUID(str(data.get("request_id", "")))
-        )
+        request_id = str(uuid.UUID(str(data.get("request_id", ""))))
     except (ValueError, TypeError, AttributeError):
         return jsonify({
             "ok": False,
@@ -878,42 +914,28 @@ def api_game_play(user):
         row = get_user_row(cur, user["id"], lock=True)
 
         if not row:
-            return jsonify({
-                "ok": False,
-                "error": "not_started",
-            }), 403
+            return jsonify({"ok": False, "error": "not_started"}), 403
 
         balance = user_balance(row)
 
-        # بازیابی همان نتیجه در درخواست تکراری.
         cur.execute("""
             SELECT *
             FROM mio_game_rounds
             WHERE user_id=%s AND request_id=%s
-        """, (
-            user["id"],
-            request_id,
-        ))
+        """, (user["id"], request_id))
 
         previous_round = cur.fetchone()
 
         if previous_round:
-            result = get_game_state(
-                cur,
-                user["id"],
-                balance,
-            )
-
+            result = get_game_state(cur, user["id"], balance)
             result.update({
                 "ok": True,
                 "replayed": True,
                 "round": public_round(previous_round),
             })
-
             return jsonify(result)
 
         now = database_now(cur)
-
         game_state = get_game_state(
             cur,
             user["id"],
@@ -955,10 +977,7 @@ def api_game_play(user):
             SET balance=COALESCE(balance, 0) + %s
             WHERE user_id=%s
             RETURNING balance
-        """, (
-            reward,
-            user["id"],
-        ))
+        """, (reward, user["id"]))
 
         new_balance = int(cur.fetchone()["balance"])
 
@@ -985,7 +1004,6 @@ def api_game_play(user):
         ))
 
         round_row = cur.fetchone()
-
         result = get_game_state(
             cur,
             user["id"],
@@ -1010,4 +1028,4 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
-)
+        )
