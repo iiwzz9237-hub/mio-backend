@@ -43,8 +43,9 @@ CORS(app)
 
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
+BALANCE_CAP = 500000
 DAILY_AMOUNT = 340000
-DAILY_BALANCE_CAP = 500000
+DAILY_BALANCE_CAP = BALANCE_CAP
 
 NORMAL_TRANSFER_DELAY = 35
 BANK_TRANSFER_DELAY = 300
@@ -150,8 +151,6 @@ def init_database():
             )
         """)
 
-        # محدودیت قبلی ۲۴۰ ثانیه‌ای نیز از زمان آخرین عملیات
-        # به ۳۰۰ ثانیه ارتقا پیدا می‌کند.
         for method, delay in (
             ("normal", NORMAL_TRANSFER_DELAY),
             ("card", BANK_TRANSFER_DELAY),
@@ -465,7 +464,6 @@ def withdrawal_payload(cur, row):
     if own_limit:
         ready_at = float(own_limit["next_allowed_at"])
 
-        # فاصلهٔ عمومی کوتاه عملیات نیز لحاظ می‌شود.
         if is_bank and normal_limit:
             ready_at = max(
                 ready_at,
@@ -590,11 +588,17 @@ def public_round(row):
     if not row:
         return None
 
+    credited_reward = int(row["reward"])
+    nominal_reward = calculate_game_reward(row["symbols"])
+
     return {
         "id": row["id"],
         "request_id": str(row["request_id"]),
         "symbols": row["symbols"],
-        "reward": int(row["reward"]),
+        # مبلغی که واقعاً به موجودی اضافه شده است.
+        "reward": credited_reward,
+        "nominal_reward": nominal_reward,
+        "reward_capped": credited_reward < nominal_reward,
         "balance_after": int(row["balance_after"]),
         "played_at": row["played_at"].timestamp(),
         "next_play_at": row["next_play_at"].timestamp(),
@@ -618,6 +622,8 @@ def get_game_state(cur, user_id, balance, now=None):
 
     remaining_seconds = 0
     next_play_at = None
+    balance = int(balance)
+    balance_limit_reached = balance >= BALANCE_CAP
 
     if latest:
         next_play_at = latest["next_play_at"]
@@ -632,7 +638,10 @@ def get_game_state(cur, user_id, balance, now=None):
             GAME_ENABLED
             and remaining_seconds == 0
             and pending is None
+            and not balance_limit_reached
         ),
+        "balance_cap": BALANCE_CAP,
+        "balance_limit_reached": balance_limit_reached,
         "withdrawal_pending": pending is not None,
         "remaining_seconds": remaining_seconds,
         "next_play_at": (
@@ -641,7 +650,7 @@ def get_game_state(cur, user_id, balance, now=None):
             else None
         ),
         "server_time": now.timestamp(),
-        "balance": int(balance),
+        "balance": balance,
         "last_round": public_round(latest),
         "payouts": GAME_PAYOUTS,
     }
@@ -911,6 +920,7 @@ def api_game_play(user):
         }), 400
 
     with db_transaction() as cur:
+        # بررسی سقف و واریز جایزه زیر همان قفل کاربر انجام می‌شوند.
         row = get_user_row(cur, user["id"], lock=True)
 
         if not row:
@@ -926,6 +936,8 @@ def api_game_play(user):
 
         previous_round = cur.fetchone()
 
+        # بازیابی نتیجه حتی در موجودی ۵۰۰ هزار باید ممکن باشد.
+        # این مسیر هیچ جایزه یا فرصت بازی جدیدی مصرف نمی‌کند.
         if previous_round:
             result = get_game_state(cur, user["id"], balance)
             result.update({
@@ -957,6 +969,14 @@ def api_game_play(user):
                 "error": "withdrawal_pending",
             }), 409
 
+        # پیش از تولید نمادها، ثبت دور و ایجاد محدودیت ۴۸ ساعته.
+        if balance >= BALANCE_CAP:
+            return jsonify({
+                **game_state,
+                "ok": False,
+                "error": "balance_limit_reached",
+            }), 409
+
         if game_state["remaining_seconds"] > 0:
             return jsonify({
                 **game_state,
@@ -969,7 +989,15 @@ def api_game_play(user):
             for _ in range(3)
         ]
 
-        reward = calculate_game_reward(symbols)
+        nominal_reward = calculate_game_reward(symbols)
+
+        # مثال: موجودی ۴۰۰ هزار و جایزه ۴۰۰ هزار
+        # فقط ۱۰۰ هزار اعتبار می‌گیرد.
+        reward = min(
+            nominal_reward,
+            max(0, BALANCE_CAP - balance),
+        )
+
         next_play_at = now + GAME_COOLDOWN
 
         cur.execute("""
@@ -1004,6 +1032,7 @@ def api_game_play(user):
         ))
 
         round_row = cur.fetchone()
+
         result = get_game_state(
             cur,
             user["id"],
@@ -1028,4 +1057,4 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
-        )
+)
