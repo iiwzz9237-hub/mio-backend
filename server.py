@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import time
 import math
@@ -60,14 +61,26 @@ GAME_PAYOUTS = {
     "blank": [0, 0, 0, 0],
 }
 
+# زمان انتظار اتصال، اجرای هر دستور و گرفتن قفل.
+DB_CONNECT_TIMEOUT = 5
+DB_STATEMENT_TIMEOUT_MS = 10000
+DB_LOCK_TIMEOUT_MS = 3000
+
+# آماده‌سازی دیتابیس خارج از worker انجام می‌شود.
+DB_INIT_STATEMENT_TIMEOUT_MS = 60000
+
 
 # ================= DATABASE =================
 
 @contextmanager
-def db_transaction():
+def db_transaction(
+    statement_timeout_ms=DB_STATEMENT_TIMEOUT_MS,
+    lock_timeout_ms=DB_LOCK_TIMEOUT_MS,
+):
     connection = psycopg2.connect(
         DATABASE_URL,
-        connect_timeout=10,
+        connect_timeout=DB_CONNECT_TIMEOUT,
+        application_name="mio-backend",
     )
 
     try:
@@ -75,107 +88,178 @@ def db_transaction():
             with connection.cursor(
                 cursor_factory=RealDictCursor
             ) as cur:
+                # تنظیمات فقط در همین تراکنش معتبرند؛
+                # برای اتصال‌های pooler نیز تنظیم دائمی باقی نمی‌گذارند.
+                cur.execute("""
+                    SELECT
+                        set_config('statement_timeout', %s, true),
+                        set_config('lock_timeout', %s, true)
+                """, (
+                    f"{int(statement_timeout_ms)}ms",
+                    f"{int(lock_timeout_ms)}ms",
+                ))
+
                 yield cur
     finally:
         connection.close()
 
 
 def init_database():
-    with db_transaction() as cur:
-        cur.execute(
-            "SELECT pg_advisory_xact_lock(%s)",
-            (748219306,),
-        )
+    """
+    فقط با اجرای مستقیم آماده‌سازی فراخوانی می‌شود.
+    هنگام import شدن توسط Gunicorn اجرا نمی‌شود.
+    """
+    stage = "connecting"
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS withdraw_queue (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                target_username TEXT,
-                amount BIGINT,
-                withdraw_type TEXT,
-                status INTEGER DEFAULT 0,
-                created_time DOUBLE PRECISION,
-                message_id BIGINT,
-                completed_time DOUBLE PRECISION
+    try:
+        with db_transaction(
+            statement_timeout_ms=DB_INIT_STATEMENT_TIMEOUT_MS,
+            lock_timeout_ms=DB_LOCK_TIMEOUT_MS,
+        ) as cur:
+            stage = "schema advisory lock"
+
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (748219306,),
             )
-        """)
 
-        cur.execute("""
-            ALTER TABLE withdraw_queue
-            ADD COLUMN IF NOT EXISTS completed_time DOUBLE PRECISION
-        """)
+            stage = "withdraw_queue table"
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS receipt_request (
-                user_id BIGINT PRIMARY KEY,
-                request INTEGER DEFAULT 0
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS mio_game_rounds (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                request_id UUID NOT NULL,
-                symbols JSONB NOT NULL,
-                reward BIGINT NOT NULL CHECK (reward >= 0),
-                balance_after BIGINT NOT NULL,
-                played_at TIMESTAMPTZ NOT NULL,
-                next_play_at TIMESTAMPTZ NOT NULL,
-                UNIQUE (user_id, request_id),
-                CHECK (next_play_at > played_at)
-            )
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS
-                mio_game_rounds_user_latest_idx
-            ON mio_game_rounds (user_id, id DESC)
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS
-                withdraw_queue_user_completed_idx
-            ON withdraw_queue (user_id, completed_time)
-            WHERE status=2
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS withdraw_transfer_limits (
-                method TEXT PRIMARY KEY,
-                delay_seconds INTEGER NOT NULL
-                    CHECK (delay_seconds > 0),
-                next_allowed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
-                updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
-            )
-        """)
-
-        for method, delay in (
-            ("normal", NORMAL_TRANSFER_DELAY),
-            ("card", BANK_TRANSFER_DELAY),
-        ):
             cur.execute("""
-                INSERT INTO withdraw_transfer_limits (
-                    method,
-                    delay_seconds,
-                    next_allowed_at,
-                    updated_at
+                CREATE TABLE IF NOT EXISTS withdraw_queue (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    target_username TEXT,
+                    amount BIGINT,
+                    withdraw_type TEXT,
+                    status INTEGER DEFAULT 0,
+                    created_time DOUBLE PRECISION,
+                    message_id BIGINT,
+                    completed_time DOUBLE PRECISION
                 )
-                VALUES (%s, %s, 0, 0)
-                ON CONFLICT (method)
-                DO UPDATE SET
-                    delay_seconds=EXCLUDED.delay_seconds,
-                    next_allowed_at=GREATEST(
-                        withdraw_transfer_limits.next_allowed_at,
-                        CASE
-                            WHEN withdraw_transfer_limits.updated_at > 0
-                            THEN withdraw_transfer_limits.updated_at
-                                + EXCLUDED.delay_seconds
-                            ELSE 0
-                        END
+            """)
+
+            stage = "checking completed_time column"
+
+            # خواندن کاتالوگ PostgreSQL به ALTER TABLE تکراری
+            # روی جدول برداشت نیاز ندارد.
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_attribute
+                    WHERE
+                        attrelid = to_regclass('withdraw_queue')
+                        AND attname = 'completed_time'
+                        AND attnum > 0
+                        AND NOT attisdropped
+                ) AS present
+            """)
+
+            has_completed_time = bool(
+                cur.fetchone()["present"]
+            )
+
+            if not has_completed_time:
+                stage = "adding completed_time column"
+
+                cur.execute("""
+                    ALTER TABLE withdraw_queue
+                    ADD COLUMN IF NOT EXISTS
+                        completed_time DOUBLE PRECISION
+                """)
+
+            stage = "receipt_request table"
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS receipt_request (
+                    user_id BIGINT PRIMARY KEY,
+                    request INTEGER DEFAULT 0
+                )
+            """)
+
+            stage = "mio_game_rounds table"
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mio_game_rounds (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    request_id UUID NOT NULL,
+                    symbols JSONB NOT NULL,
+                    reward BIGINT NOT NULL CHECK (reward >= 0),
+                    balance_after BIGINT NOT NULL,
+                    played_at TIMESTAMPTZ NOT NULL,
+                    next_play_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE (user_id, request_id),
+                    CHECK (next_play_at > played_at)
+                )
+            """)
+
+            stage = "game rounds index"
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS
+                    mio_game_rounds_user_latest_idx
+                ON mio_game_rounds (user_id, id DESC)
+            """)
+
+            stage = "completed withdrawals index"
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS
+                    withdraw_queue_user_completed_idx
+                ON withdraw_queue (user_id, completed_time)
+                WHERE status=2
+            """)
+
+            stage = "withdraw_transfer_limits table"
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS withdraw_transfer_limits (
+                    method TEXT PRIMARY KEY,
+                    delay_seconds INTEGER NOT NULL
+                        CHECK (delay_seconds > 0),
+                    next_allowed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+                )
+            """)
+
+            stage = "transfer limits"
+
+            for method, delay in (
+                ("normal", NORMAL_TRANSFER_DELAY),
+                ("card", BANK_TRANSFER_DELAY),
+            ):
+                cur.execute("""
+                    INSERT INTO withdraw_transfer_limits (
+                        method,
+                        delay_seconds,
+                        next_allowed_at,
+                        updated_at
                     )
-            """, (method, delay))
+                    VALUES (%s, %s, 0, 0)
+                    ON CONFLICT (method)
+                    DO UPDATE SET
+                        delay_seconds=EXCLUDED.delay_seconds,
+                        next_allowed_at=GREATEST(
+                            withdraw_transfer_limits.next_allowed_at,
+                            CASE
+                                WHEN withdraw_transfer_limits.updated_at > 0
+                                THEN withdraw_transfer_limits.updated_at
+                                    + EXCLUDED.delay_seconds
+                                ELSE 0
+                            END
+                        )
+                """, (method, delay))
+
+        print("✅ Database initialization completed.", flush=True)
+
+    except Exception:
+        # خطا پنهان نمی‌شود و دیتابیس نیمه‌آماده تأیید نمی‌شود.
+        app.logger.exception(
+            "Database initialization failed at stage: %s",
+            stage,
+        )
+        raise
 
 
 @app.errorhandler(psycopg2.Error)
@@ -518,7 +602,14 @@ def withdrawal_payload(cur, row):
 
 def get_withdrawn_today(cur, user_id):
     now = database_now(cur).astimezone(IRAN_TZ)
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    day_start = now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
     day_end = day_start + timedelta(days=1)
 
     cur.execute("""
@@ -595,7 +686,6 @@ def public_round(row):
         "id": row["id"],
         "request_id": str(row["request_id"]),
         "symbols": row["symbols"],
-        # مبلغی که واقعاً به موجودی اضافه شده است.
         "reward": credited_reward,
         "nominal_reward": nominal_reward,
         "reward_capped": credited_reward < nominal_reward,
@@ -622,11 +712,13 @@ def get_game_state(cur, user_id, balance, now=None):
 
     remaining_seconds = 0
     next_play_at = None
+
     balance = int(balance)
     balance_limit_reached = balance >= BALANCE_CAP
 
     if latest:
         next_play_at = latest["next_play_at"]
+
         remaining_seconds = max(
             0,
             math.ceil((next_play_at - now).total_seconds()),
@@ -660,6 +752,7 @@ def get_game_state(cur, user_id, balance, now=None):
 
 @app.route("/")
 def health():
+    # سلامت پردازش وب؛ تضمین سلامت دیتابیس نیست.
     return jsonify({
         "status": "ok",
         "service": "mio-backend",
@@ -688,9 +781,15 @@ def api_user(user):
         return jsonify({
             "balance": user_balance(row),
             "daily_enabled": row["daily_mio"] == 1,
-            "notifications": get_recent_notifications(cur, user["id"]),
+            "notifications": get_recent_notifications(
+                cur,
+                user["id"],
+            ),
             "not_started": False,
-            "withdrawn_today": get_withdrawn_today(cur, user["id"]),
+            "withdrawn_today": get_withdrawn_today(
+                cur,
+                user["id"],
+            ),
             "pending_withdrawal": pending[0] if pending else None,
             "pending_withdrawals": pending,
         })
@@ -724,6 +823,7 @@ def create_withdrawal(user, target, withdraw_type):
 
         if pending:
             result = withdrawal_payload(cur, pending)
+
             result.update({
                 "ok": False,
                 "error": "already_pending",
@@ -770,12 +870,18 @@ def api_withdraw(user):
     target = json_body().get("target")
 
     if not isinstance(target, str):
-        return jsonify({"ok": False, "error": "invalid_target"}), 400
+        return jsonify({
+            "ok": False,
+            "error": "invalid_target",
+        }), 400
 
     target = target.strip()
 
     if not re.fullmatch(r"@[A-Za-z0-9_]{1,32}", target):
-        return jsonify({"ok": False, "error": "invalid_target"}), 400
+        return jsonify({
+            "ok": False,
+            "error": "invalid_target",
+        }), 400
 
     return create_withdrawal(user, target, "id")
 
@@ -786,12 +892,18 @@ def api_withdraw_bank(user):
     card = json_body().get("card")
 
     if not isinstance(card, str):
-        return jsonify({"ok": False, "error": "invalid_card"}), 400
+        return jsonify({
+            "ok": False,
+            "error": "invalid_card",
+        }), 400
 
     card = card.strip()
 
     if not re.fullmatch(r"[0-9]{10,20}", card):
-        return jsonify({"ok": False, "error": "invalid_card"}), 400
+        return jsonify({
+            "ok": False,
+            "error": "invalid_card",
+        }), 400
 
     return create_withdrawal(user, card, "card")
 
@@ -852,7 +964,10 @@ def api_daily_enable(user):
         row = get_user_row(cur, user["id"], lock=True)
 
         if not row:
-            return jsonify({"ok": False, "error": "not_started"}), 403
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
 
         current_balance = user_balance(row)
 
@@ -870,7 +985,10 @@ def api_daily_enable(user):
 
         daily_credit = max(
             0,
-            min(DAILY_AMOUNT, DAILY_BALANCE_CAP - current_balance),
+            min(
+                DAILY_AMOUNT,
+                DAILY_BALANCE_CAP - current_balance,
+            ),
         )
 
         cur.execute("""
@@ -884,7 +1002,10 @@ def api_daily_enable(user):
 
         balance = int(cur.fetchone()["balance"])
 
-    return jsonify({"ok": True, "balance": balance})
+    return jsonify({
+        "ok": True,
+        "balance": balance,
+    })
 
 
 @app.route("/api/game/status")
@@ -894,13 +1015,17 @@ def api_game_status(user):
         row = get_user_row(cur, user["id"], lock=True)
 
         if not row:
-            return jsonify({"ok": False, "error": "not_started"}), 403
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
 
         result = get_game_state(
             cur,
             user["id"],
             user_balance(row),
         )
+
         result["ok"] = True
 
     return jsonify(result)
@@ -912,7 +1037,9 @@ def api_game_play(user):
     data = json_body()
 
     try:
-        request_id = str(uuid.UUID(str(data.get("request_id", ""))))
+        request_id = str(
+            uuid.UUID(str(data.get("request_id", "")))
+        )
     except (ValueError, TypeError, AttributeError):
         return jsonify({
             "ok": False,
@@ -920,11 +1047,14 @@ def api_game_play(user):
         }), 400
 
     with db_transaction() as cur:
-        # بررسی سقف و واریز جایزه زیر همان قفل کاربر انجام می‌شوند.
+        # قفل کاربر، بررسی سقف و ثبت جایزه در یک تراکنش.
         row = get_user_row(cur, user["id"], lock=True)
 
         if not row:
-            return jsonify({"ok": False, "error": "not_started"}), 403
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
 
         balance = user_balance(row)
 
@@ -936,18 +1066,25 @@ def api_game_play(user):
 
         previous_round = cur.fetchone()
 
-        # بازیابی نتیجه حتی در موجودی ۵۰۰ هزار باید ممکن باشد.
-        # این مسیر هیچ جایزه یا فرصت بازی جدیدی مصرف نمی‌کند.
+        # بازیابی نتیجه از سقف موجودی مستقل است.
+        # هیچ جایزه یا فرصت تازه‌ای مصرف نمی‌کند.
         if previous_round:
-            result = get_game_state(cur, user["id"], balance)
+            result = get_game_state(
+                cur,
+                user["id"],
+                balance,
+            )
+
             result.update({
                 "ok": True,
                 "replayed": True,
                 "round": public_round(previous_round),
             })
+
             return jsonify(result)
 
         now = database_now(cur)
+
         game_state = get_game_state(
             cur,
             user["id"],
@@ -969,7 +1106,7 @@ def api_game_play(user):
                 "error": "withdrawal_pending",
             }), 409
 
-        # پیش از تولید نمادها، ثبت دور و ایجاد محدودیت ۴۸ ساعته.
+        # پیش از تولید نتیجه و ثبت محدودیت ۴۸ ساعته.
         if balance >= BALANCE_CAP:
             return jsonify({
                 **game_state,
@@ -991,8 +1128,6 @@ def api_game_play(user):
 
         nominal_reward = calculate_game_reward(symbols)
 
-        # مثال: موجودی ۴۰۰ هزار و جایزه ۴۰۰ هزار
-        # فقط ۱۰۰ هزار اعتبار می‌گیرد.
         reward = min(
             nominal_reward,
             max(0, BALANCE_CAP - balance),
@@ -1051,10 +1186,20 @@ def api_game_play(user):
 
 # ================= STARTUP =================
 
-init_database()
+# عمداً بیرون این شرط init_database() نداریم.
+# Gunicorn فقط app را import می‌کند.
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000)),
-    )
+    if len(sys.argv) == 2 and sys.argv[1] == "--init-db":
+        init_database()
+    elif len(sys.argv) == 1:
+        init_database()
+
+        app.run(
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", 5000)),
+        )
+    else:
+        raise SystemExit(
+            "Usage: python server.py [--init-db]"
+            )
