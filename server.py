@@ -13,6 +13,7 @@ from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import wraps, lru_cache
+from threading import Lock
 from urllib.parse import parse_qsl
 
 import psycopg2
@@ -235,6 +236,135 @@ def init_database():
         """)
 
     print("Database initialization completed.", flush=True)
+
+
+# ================= DOZ DATABASE READINESS =================
+
+_doz_database_ready = False
+_doz_database_lock = Lock()
+
+
+def get_doz_database_objects(cur):
+    cur.execute("""
+        SELECT
+            to_regclass('mio_doz_sessions') IS NOT NULL
+                AS sessions_exists,
+            to_regclass('mio_doz_rounds') IS NOT NULL
+                AS rounds_exists,
+            to_regclass('mio_doz_rounds_user_created_idx') IS NOT NULL
+                AS index_exists
+    """)
+
+    return cur.fetchone()
+
+
+def ensure_doz_database():
+    """
+    هنگام اجرای gunicorn server:app نیز فراخوانی می‌شود.
+
+    پیش از پردازش اولین درخواست دوز، وجود جدول‌ها بررسی
+    می‌شود و فقط اجزای موجودنبوده ساخته می‌شوند.
+
+    آماده‌بودن تنها پس از commit موفق ثبت می‌شود.
+    در صورت خطا، درخواست بعدی امکان بررسی مجدد دارد.
+    """
+    global _doz_database_ready
+
+    if _doz_database_ready:
+        return
+
+    acquired = _doz_database_lock.acquire(timeout=1)
+
+    if not acquired:
+        raise psycopg2.OperationalError(
+            "Doz database initialization is busy; retry the request."
+        )
+
+    try:
+        if _doz_database_ready:
+            return
+
+        created_objects = []
+
+        with db_transaction(
+            statement_timeout_ms=3000,
+            lock_timeout_ms=1000,
+        ) as cur:
+            objects = get_doz_database_objects(cur)
+
+            if not all(objects.values()):
+                # همان قفل init_database برای جلوگیری از ساخت هم‌زمان
+                # توسط چند worker یا فرمان --init-db.
+                cur.execute(
+                    "SELECT pg_try_advisory_xact_lock(%s) AS acquired",
+                    (748219306,),
+                )
+
+                if not cur.fetchone()["acquired"]:
+                    raise psycopg2.OperationalError(
+                        "Database initialization is running in another "
+                        "process; retry the request."
+                    )
+
+                # ممکن است worker دیگر قبل از گرفتن قفل،
+                # جدول‌ها را ساخته باشد.
+                objects = get_doz_database_objects(cur)
+
+                if not objects["sessions_exists"]:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS mio_doz_sessions (
+                            user_id BIGINT PRIMARY KEY,
+                            data JSONB NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL
+                                DEFAULT clock_timestamp()
+                        )
+                    """)
+
+                    created_objects.append("mio_doz_sessions")
+
+                if not objects["rounds_exists"]:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS mio_doz_rounds (
+                            id UUID PRIMARY KEY,
+                            user_id BIGINT NOT NULL,
+                            data JSONB NOT NULL,
+                            created_at TIMESTAMPTZ NOT NULL
+                                DEFAULT clock_timestamp(),
+                            updated_at TIMESTAMPTZ NOT NULL
+                                DEFAULT clock_timestamp()
+                        )
+                    """)
+
+                    created_objects.append("mio_doz_rounds")
+
+                if not objects["index_exists"]:
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS
+                            mio_doz_rounds_user_created_idx
+                        ON mio_doz_rounds (user_id, created_at DESC)
+                    """)
+
+                    created_objects.append(
+                        "mio_doz_rounds_user_created_idx"
+                    )
+
+        # خروج موفق از db_transaction یعنی commit انجام شده است.
+        _doz_database_ready = True
+
+        if created_objects:
+            print(
+                "Doz database ready. Created: "
+                + ", ".join(created_objects),
+                flush=True,
+            )
+        else:
+            print(
+                "Doz database ready. Existing tables verified.",
+                flush=True,
+            )
+
+    finally:
+        _doz_database_lock.release()
 
 
 @app.errorhandler(psycopg2.Error)
@@ -1200,6 +1330,10 @@ def doz_save_round(cur, user_id, round_data):
 # ================= DOZ API =================
 
 def handle_doz(user, action):
+    # پیش از هرگونه INSERT یا SELECT مربوط به دوز،
+    # جدول‌های لازم آماده و تراکنش ساخت آن‌ها commit می‌شود.
+    ensure_doz_database()
+
     body = json_body()
     user_id = user["id"]
 
