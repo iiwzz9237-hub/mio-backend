@@ -26,8 +26,13 @@ from flask_cors import CORS
 # ================= CONFIG =================
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BOT_USERNAME = (os.environ.get("BOT_USERNAME") or "").lstrip("@")
+
+# فاصله یا خط جدیدِ اضافی اطراف توکن حذف می‌شود.
+BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
+
+BOT_USERNAME = (
+    os.environ.get("BOT_USERNAME") or ""
+).strip().lstrip("@")
 
 GAME_ENABLED = (
     os.environ.get("GAME_ENABLED", "true").strip().lower()
@@ -66,18 +71,23 @@ DOZ_DRAW_REWARD = 5000
 DOZ_SERIES_SIZE = 5
 DOZ_COOLDOWN_SECONDS = 86400
 
-doz_reward_setting = os.environ.get("DOZ_WIN_REWARD", "").strip()
+doz_reward_setting = os.environ.get(
+    "DOZ_WIN_REWARD", ""
+).strip()
 
 if doz_reward_setting:
     try:
         DOZ_WIN_REWARD = int(doz_reward_setting)
+
     except ValueError as exc:
         raise RuntimeError(
             "DOZ_WIN_REWARD باید عدد صحیح نامنفی باشد."
         ) from exc
 
     if DOZ_WIN_REWARD < 0:
-        raise RuntimeError("DOZ_WIN_REWARD نباید منفی باشد.")
+        raise RuntimeError(
+            "DOZ_WIN_REWARD نباید منفی باشد."
+        )
 else:
     DOZ_WIN_REWARD = None
 
@@ -85,7 +95,10 @@ else:
 # ================= DATABASE =================
 
 @contextmanager
-def db_transaction(statement_timeout_ms=10000, lock_timeout_ms=3000):
+def db_transaction(
+    statement_timeout_ms=10000,
+    lock_timeout_ms=3000,
+):
     connection = psycopg2.connect(
         DATABASE_URL,
         connect_timeout=5,
@@ -94,22 +107,29 @@ def db_transaction(statement_timeout_ms=10000, lock_timeout_ms=3000):
 
     try:
         with connection:
-            with connection.cursor(cursor_factory=RealDictCursor) as cur:
+            with connection.cursor(
+                cursor_factory=RealDictCursor
+            ) as cur:
                 cur.execute(
                     "SELECT set_config('statement_timeout', %s, true)",
                     (f"{statement_timeout_ms}ms",),
                 )
+
                 cur.execute(
                     "SELECT set_config('lock_timeout', %s, true)",
                     (f"{lock_timeout_ms}ms",),
                 )
+
                 yield cur
+
     finally:
         connection.close()
 
 
 def init_database():
-    with db_transaction(statement_timeout_ms=60000) as cur:
+    with db_transaction(
+        statement_timeout_ms=60000
+    ) as cur:
         cur.execute(
             "SELECT pg_advisory_xact_lock(%s)",
             (748219306,),
@@ -134,9 +154,9 @@ def init_database():
                 SELECT 1
                 FROM pg_attribute
                 WHERE attrelid=to_regclass('withdraw_queue')
-                    AND attname='completed_time'
-                    AND attnum > 0
-                    AND NOT attisdropped
+                  AND attname='completed_time'
+                  AND attnum > 0
+                  AND NOT attisdropped
             ) AS present
         """)
 
@@ -183,9 +203,12 @@ def init_database():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS withdraw_transfer_limits (
                 method TEXT PRIMARY KEY,
-                delay_seconds INTEGER NOT NULL CHECK (delay_seconds > 0),
-                next_allowed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
-                updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+                delay_seconds INTEGER NOT NULL
+                    CHECK (delay_seconds > 0),
+                next_allowed_at DOUBLE PRECISION
+                    NOT NULL DEFAULT 0,
+                updated_at DOUBLE PRECISION
+                    NOT NULL DEFAULT 0
             )
         """)
 
@@ -195,12 +218,17 @@ def init_database():
         ):
             cur.execute("""
                 INSERT INTO withdraw_transfer_limits (
-                    method, delay_seconds, next_allowed_at, updated_at
+                    method,
+                    delay_seconds,
+                    next_allowed_at,
+                    updated_at
                 )
                 VALUES (%s, %s, 0, 0)
+
                 ON CONFLICT (method)
                 DO UPDATE SET
                     delay_seconds=EXCLUDED.delay_seconds,
+
                     next_allowed_at=GREATEST(
                         withdraw_transfer_limits.next_allowed_at,
                         CASE
@@ -216,7 +244,8 @@ def init_database():
             CREATE TABLE IF NOT EXISTS mio_doz_sessions (
                 user_id BIGINT PRIMARY KEY,
                 data JSONB NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+                updated_at TIMESTAMPTZ NOT NULL
+                    DEFAULT clock_timestamp()
             )
         """)
 
@@ -225,8 +254,10 @@ def init_database():
                 id UUID PRIMARY KEY,
                 user_id BIGINT NOT NULL,
                 data JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+                created_at TIMESTAMPTZ NOT NULL
+                    DEFAULT clock_timestamp(),
+                updated_at TIMESTAMPTZ NOT NULL
+                    DEFAULT clock_timestamp()
             )
         """)
 
@@ -235,7 +266,10 @@ def init_database():
             ON mio_doz_rounds (user_id, created_at DESC)
         """)
 
-    print("Database initialization completed.", flush=True)
+    print(
+        "Database initialization completed.",
+        flush=True,
+    )
 
 
 # ================= DOZ DATABASE READINESS =================
@@ -249,8 +283,10 @@ def get_doz_database_objects(cur):
         SELECT
             to_regclass('mio_doz_sessions') IS NOT NULL
                 AS sessions_exists,
+
             to_regclass('mio_doz_rounds') IS NOT NULL
                 AS rounds_exists,
+
             to_regclass('mio_doz_rounds_user_created_idx') IS NOT NULL
                 AS index_exists
     """)
@@ -260,13 +296,8 @@ def get_doz_database_objects(cur):
 
 def ensure_doz_database():
     """
-    هنگام اجرای gunicorn server:app نیز فراخوانی می‌شود.
-
-    پیش از پردازش اولین درخواست دوز، وجود جدول‌ها بررسی
-    می‌شود و فقط اجزای موجودنبوده ساخته می‌شوند.
-
-    آماده‌بودن تنها پس از commit موفق ثبت می‌شود.
-    در صورت خطا، درخواست بعدی امکان بررسی مجدد دارد.
+    پیش از اولین درخواست دوز، جدول‌های موردنیاز بررسی می‌شوند.
+    آماده بودن فقط بعد از commit موفق ثبت می‌شود.
     """
     global _doz_database_ready
 
@@ -293,8 +324,6 @@ def ensure_doz_database():
             objects = get_doz_database_objects(cur)
 
             if not all(objects.values()):
-                # همان قفل init_database برای جلوگیری از ساخت هم‌زمان
-                # توسط چند worker یا فرمان --init-db.
                 cur.execute(
                     "SELECT pg_try_advisory_xact_lock(%s) AS acquired",
                     (748219306,),
@@ -306,8 +335,6 @@ def ensure_doz_database():
                         "process; retry the request."
                     )
 
-                # ممکن است worker دیگر قبل از گرفتن قفل،
-                # جدول‌ها را ساخته باشد.
                 objects = get_doz_database_objects(cur)
 
                 if not objects["sessions_exists"]:
@@ -320,7 +347,9 @@ def ensure_doz_database():
                         )
                     """)
 
-                    created_objects.append("mio_doz_sessions")
+                    created_objects.append(
+                        "mio_doz_sessions"
+                    )
 
                 if not objects["rounds_exists"]:
                     cur.execute("""
@@ -335,7 +364,9 @@ def ensure_doz_database():
                         )
                     """)
 
-                    created_objects.append("mio_doz_rounds")
+                    created_objects.append(
+                        "mio_doz_rounds"
+                    )
 
                 if not objects["index_exists"]:
                     cur.execute("""
@@ -348,7 +379,6 @@ def ensure_doz_database():
                         "mio_doz_rounds_user_created_idx"
                     )
 
-        # خروج موفق از db_transaction یعنی commit انجام شده است.
         _doz_database_ready = True
 
         if created_objects:
@@ -369,7 +399,9 @@ def ensure_doz_database():
 
 @app.errorhandler(psycopg2.Error)
 def database_error(error):
-    app.logger.exception("Database operation failed")
+    app.logger.exception(
+        "Database operation failed"
+    )
 
     return jsonify({
         "ok": False,
@@ -377,11 +409,25 @@ def database_error(error):
     }), 503
 
 
-# ================= AUTH =================
+# ================= TELEGRAM AUTH =================
 
-def verify_init_data(init_data):
-    if not init_data or len(init_data) > 20000:
-        return None
+def validate_init_data(init_data):
+    """
+    خروجی:
+        (user, None) در صورت موفقیت
+        (None, reason) در صورت رد ورود
+
+    اطلاعات ورود فقط با امضای معتبر تلگرام پذیرفته می‌شود.
+    توکن، متن initData و امضاها در لاگ ثبت نمی‌شوند.
+    """
+    if not isinstance(init_data, str):
+        return None, "invalid_init_data_type"
+
+    if not init_data:
+        return None, "missing_init_data"
+
+    if len(init_data) > 20000:
+        return None, "init_data_too_long"
 
     try:
         items = parse_qsl(
@@ -389,110 +435,182 @@ def verify_init_data(init_data):
             keep_blank_values=True,
             strict_parsing=True,
         )
+    except (ValueError, TypeError, UnicodeError):
+        return None, "malformed_init_data"
 
-        pairs = dict(items)
+    pairs = dict(items)
 
-        if len(items) != len(pairs):
-            return None
+    if len(items) != len(pairs):
+        return None, "duplicate_init_data_fields"
 
-        received_hash = pairs.pop("hash", None)
+    received_hash = pairs.pop("hash", None)
 
-        if not received_hash:
-            return None
+    if not received_hash:
+        return None, "missing_hash"
 
-        if not re.fullmatch(r"[0-9a-fA-F]{64}", received_hash):
-            return None
+    if not re.fullmatch(
+        r"[0-9a-fA-F]{64}",
+        received_hash,
+    ):
+        return None, "invalid_hash_format"
 
-        data_check_string = "\n".join(
-            f"{key}={value}"
-            for key, value in sorted(pairs.items())
-        )
+    # برای اعتبارسنجی HMAC با توکن بات، فقط hash حذف می‌شود.
+    # بقیهٔ فیلدهای دریافتی در رشتهٔ بررسی باقی می‌مانند.
+    data_check_string = "\n".join(
+        f"{key}={value}"
+        for key, value in sorted(pairs.items())
+    )
 
+    try:
         secret_key = hmac.new(
             b"WebAppData",
-            BOT_TOKEN.encode(),
+            BOT_TOKEN.encode("utf-8"),
             hashlib.sha256,
         ).digest()
 
         computed_hash = hmac.new(
             secret_key,
-            data_check_string.encode(),
+            data_check_string.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
 
-        if not hmac.compare_digest(
-            computed_hash,
-            received_hash.lower(),
-        ):
-            return None
+    except (ValueError, TypeError, UnicodeError):
+        return None, "invalid_auth_encoding"
 
-        auth_date = int(pairs.get("auth_date", "0"))
-        now = time.time()
+    if not hmac.compare_digest(
+        computed_hash,
+        received_hash.lower(),
+    ):
+        return None, "invalid_signature"
 
-        if auth_date <= 0:
-            return None
-
-        if now - auth_date > 86400 or auth_date > now + 30:
-            return None
-
-        user = json.loads(pairs.get("user", ""))
-
-        if not isinstance(user, dict):
-            return None
-
-        user_id = user.get("id")
-
-        if (
-            not isinstance(user_id, int)
-            or isinstance(user_id, bool)
-            or user_id <= 0
-        ):
-            return None
-
-        return {
-            "id": user_id,
-            "username": user.get("username"),
-            "first_name": user.get("first_name"),
-        }
-
+    try:
+        auth_date = int(
+            pairs.get("auth_date", "0")
+        )
     except (ValueError, TypeError):
-        return None
+        return None, "invalid_auth_date"
+
+    now = time.time()
+
+    if auth_date <= 0:
+        return None, "invalid_auth_date"
+
+    if auth_date > now + 30:
+        return None, "auth_date_in_future"
+
+    if now - auth_date > 86400:
+        return None, "init_data_expired"
+
+    user_json = pairs.get("user")
+
+    if not user_json:
+        return None, "missing_user"
+
+    try:
+        user = json.loads(user_json)
+    except (ValueError, TypeError):
+        return None, "invalid_user_json"
+
+    if not isinstance(user, dict):
+        return None, "invalid_user_object"
+
+    user_id = user.get("id")
+
+    if (
+        not isinstance(user_id, int)
+        or isinstance(user_id, bool)
+        or user_id <= 0
+    ):
+        return None, "invalid_user_id"
+
+    return {
+        "id": user_id,
+        "username": user.get("username"),
+        "first_name": user.get("first_name"),
+    }, None
+
+
+def verify_init_data(init_data):
+    # خروجی تابع قبلی حفظ شده است: کاربر معتبر یا None.
+    user, _ = validate_init_data(init_data)
+    return user
+
+
+def get_auth_result():
+    header = request.headers.get(
+        "Authorization", ""
+    )
+
+    if not header:
+        return None, "missing_authorization_header"
+
+    scheme, separator, init_data = header.partition(" ")
+
+    if scheme.lower() != "tma":
+        return None, "invalid_authorization_scheme"
+
+    # مرورگر ممکن است فاصلهٔ انتهای هدر خالی "tma " را حذف کند.
+    if not separator or not init_data:
+        return None, "missing_init_data"
+
+    return validate_init_data(init_data)
 
 
 def get_authenticated_user():
-    header = request.headers.get("Authorization", "")
-
-    if not header.startswith("tma "):
-        return None
-
-    return verify_init_data(header[4:])
+    user, _ = get_auth_result()
+    return user
 
 
 def authenticated(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
-        user = get_authenticated_user()
+        user, reason = get_auth_result()
 
         if not user:
-            return jsonify({
+            # فقط کد خطا و مسیر ثبت می‌شوند.
+            # هیچ توکن، هدر ورود یا اطلاعات حسابی ثبت نمی‌شود.
+            app.logger.warning(
+                "AUTH_DENIED reason=%s path=%s",
+                reason,
+                request.path,
+            )
+
+            response = jsonify({
                 "ok": False,
                 "error": "unauthorized",
-            }), 401
+                "auth_reason": reason,
+            })
 
-        return view(user, *args, **kwargs)
+            response.headers["Cache-Control"] = "no-store"
+
+            return response, 401
+
+        return view(
+            user,
+            *args,
+            **kwargs,
+        )
 
     return wrapped
 
 
 def json_body():
     data = request.get_json(silent=True)
-    return data if isinstance(data, dict) else {}
+
+    return (
+        data
+        if isinstance(data, dict)
+        else {}
+    )
 
 
 # ================= HELPERS =================
 
 def database_now(cur):
-    cur.execute("SELECT clock_timestamp() AS now")
+    cur.execute(
+        "SELECT clock_timestamp() AS now"
+    )
+
     return cur.fetchone()["now"]
 
 
@@ -506,7 +624,11 @@ def get_user_row(cur, user_id, lock=False):
     if lock:
         query += " FOR UPDATE"
 
-    cur.execute(query, (user_id,))
+    cur.execute(
+        query,
+        (user_id,),
+    )
+
     return cur.fetchone()
 
 
@@ -526,28 +648,54 @@ def to_iran_time_str(timestamp):
 
 def format_queue_duration(seconds):
     seconds = max(0, int(seconds))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
+
+    hours, remainder = divmod(
+        seconds,
+        3600,
+    )
+
+    minutes, seconds = divmod(
+        remainder,
+        60,
+    )
 
     parts = []
 
     if hours:
-        parts.append(f"{hours} ساعت")
-    if minutes:
-        parts.append(f"{minutes} دقیقه")
-    if seconds:
-        parts.append(f"{seconds} ثانیه")
+        parts.append(
+            f"{hours} ساعت"
+        )
 
-    return " و ".join(parts) if parts else "چند لحظه"
+    if minutes:
+        parts.append(
+            f"{minutes} دقیقه"
+        )
+
+    if seconds:
+        parts.append(
+            f"{seconds} ثانیه"
+        )
+
+    return (
+        " و ".join(parts)
+        if parts
+        else "چند لحظه"
+    )
 
 
 # ================= QUEUE =================
 
 def get_pending_withdrawal(cur, user_id):
     cur.execute("""
-        SELECT id, user_id, amount, status, withdraw_type
+        SELECT
+            id,
+            user_id,
+            amount,
+            status,
+            withdraw_type
         FROM withdraw_queue
-        WHERE user_id=%s AND status IN (0, 1)
+        WHERE user_id=%s
+          AND status IN (0, 1)
         ORDER BY id ASC
         LIMIT 1
     """, (user_id,))
@@ -557,19 +705,31 @@ def get_pending_withdrawal(cur, user_id):
 
 def get_pending_withdrawals(cur, user_id):
     cur.execute("""
-        SELECT id, user_id, amount, status, withdraw_type
+        SELECT
+            id,
+            user_id,
+            amount,
+            status,
+            withdraw_type
         FROM withdraw_queue
-        WHERE user_id=%s AND status IN (0, 1)
+        WHERE user_id=%s
+          AND status IN (0, 1)
         ORDER BY id ASC
     """, (user_id,))
 
     rows = cur.fetchall()
-    return [withdrawal_payload(cur, row) for row in rows]
+
+    return [
+        withdrawal_payload(cur, row)
+        for row in rows
+    ]
 
 
 def withdrawal_payload(cur, row):
     if not row:
-        return {"status": "none"}
+        return {
+            "status": "none"
+        }
 
     status_code = row["status"]
     is_bank = row["withdraw_type"] == "card"
@@ -602,6 +762,7 @@ def withdrawal_payload(cur, row):
                 else "در حال پردازش انتقال"
             ),
         })
+
         return result
 
     cur.execute("""
@@ -612,26 +773,36 @@ def withdrawal_payload(cur, row):
             AND id <= %s
             AND (
                 CASE
-                    WHEN withdraw_type='card' THEN 'card'
+                    WHEN withdraw_type='card'
+                    THEN 'card'
                     ELSE 'normal'
                 END
             ) = %s
     """, (row["id"], method))
 
-    position = max(1, int(cur.fetchone()["position"]))
+    position = max(
+        1,
+        int(cur.fetchone()["position"]),
+    )
 
     cur.execute("""
         SELECT
             method,
             delay_seconds,
             next_allowed_at,
-            EXTRACT(EPOCH FROM clock_timestamp())::double precision
-                AS server_now
+
+            EXTRACT(
+                EPOCH FROM clock_timestamp()
+            )::double precision AS server_now
+
         FROM withdraw_transfer_limits
         WHERE method IN ('normal', 'card')
     """)
 
-    limits = {item["method"]: item for item in cur.fetchall()}
+    limits = {
+        item["method"]: item
+        for item in cur.fetchall()
+    }
 
     own_limit = limits.get(method)
     normal_limit = limits.get("normal")
@@ -639,33 +810,53 @@ def withdrawal_payload(cur, row):
     delay_seconds = (
         int(own_limit["delay_seconds"])
         if own_limit
-        else BANK_TRANSFER_DELAY if is_bank else NORMAL_TRANSFER_DELAY
+        else BANK_TRANSFER_DELAY
+        if is_bank
+        else NORMAL_TRANSFER_DELAY
     )
 
     if own_limit:
-        ready_at = float(own_limit["next_allowed_at"])
+        ready_at = float(
+            own_limit["next_allowed_at"]
+        )
 
         if is_bank and normal_limit:
             ready_at = max(
                 ready_at,
-                float(normal_limit["next_allowed_at"]),
+                float(
+                    normal_limit["next_allowed_at"]
+                ),
             )
 
         cooldown_remaining = max(
             0,
-            math.ceil(ready_at - float(own_limit["server_now"])),
+            math.ceil(
+                ready_at
+                - float(own_limit["server_now"])
+            ),
         )
+
     else:
         cooldown_remaining = 0
 
-    wait_seconds = cooldown_remaining + (position - 1) * delay_seconds
+    wait_seconds = (
+        cooldown_remaining
+        + (position - 1) * delay_seconds
+    )
 
     if wait_seconds > 0:
-        label = "بانک میویی" if is_bank else "انتقال میویی"
+        label = (
+            "بانک میویی"
+            if is_bank
+            else "انتقال میویی"
+        )
+
         wait_text = (
-            f"{label}: حدود {format_queue_duration(wait_seconds)} "
+            f"{label}: حدود "
+            f"{format_queue_duration(wait_seconds)} "
             "تا نوبت شروع پردازش"
         )
+
     else:
         cur.execute("""
             SELECT EXISTS (
@@ -694,24 +885,38 @@ def withdrawal_payload(cur, row):
 # ================= WITHDRAW TOTAL / NOTIFICATIONS =================
 
 def get_withdrawn_today(cur, user_id):
-    now = database_now(cur).astimezone(IRAN_TZ)
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end = day_start + timedelta(days=1)
+    now = database_now(cur).astimezone(
+        IRAN_TZ
+    )
+
+    day_start = now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    day_end = day_start + timedelta(
+        days=1
+    )
 
     cur.execute("""
         SELECT COALESCE(SUM(amount), 0) AS total
         FROM withdraw_queue
+
         WHERE user_id=%s
-            AND status=2
-            AND completed_time >= %s
-            AND completed_time < %s
+          AND status=2
+          AND completed_time >= %s
+          AND completed_time < %s
     """, (
         user_id,
         day_start.timestamp(),
         day_end.timestamp(),
     ))
 
-    return int(cur.fetchone()["total"])
+    return int(
+        cur.fetchone()["total"]
+    )
 
 
 def get_recent_notifications(cur, user_id):
@@ -720,30 +925,52 @@ def get_recent_notifications(cur, user_id):
             id,
             amount,
             status,
-            COALESCE(completed_time, created_time) AS event_time
+            COALESCE(
+                completed_time,
+                created_time
+            ) AS event_time
+
         FROM withdraw_queue
-        WHERE user_id=%s AND status IN (2, 3, 4)
+
+        WHERE user_id=%s
+          AND status IN (2, 3, 4)
+
         ORDER BY
-            COALESCE(completed_time, created_time) DESC NULLS LAST,
+            COALESCE(
+                completed_time,
+                created_time
+            ) DESC NULLS LAST,
             id DESC
+
         LIMIT 10
     """, (user_id,))
 
     notifications = []
 
     for row in cur.fetchall():
-        amount = int(row["amount"] or 0)
+        amount = int(
+            row["amount"] or 0
+        )
+
         success = row["status"] == 2
 
         notifications.append({
-            "id": f"withdraw:{row['id']}:{row['status']}",
-            "type": "success" if success else "fail",
+            "id": (
+                f"withdraw:{row['id']}:{row['status']}"
+            ),
+            "type": (
+                "success"
+                if success
+                else "fail"
+            ),
             "text": (
                 f"🎉 برداشت {amount:,} میو با موفقیت ثبت شد."
                 if success
                 else f"❌ برداشت {amount:,} میو ناموفق بود."
             ),
-            "time": to_iran_time_str(row["event_time"]),
+            "time": to_iran_time_str(
+                row["event_time"]
+            ),
         })
 
     return notifications
@@ -764,8 +991,13 @@ def public_round(row):
     if not row:
         return None
 
-    credited_reward = int(row["reward"])
-    nominal_reward = calculate_game_reward(row["symbols"])
+    credited_reward = int(
+        row["reward"]
+    )
+
+    nominal_reward = calculate_game_reward(
+        row["symbols"]
+    )
 
     return {
         "id": row["id"],
@@ -773,14 +1005,27 @@ def public_round(row):
         "symbols": row["symbols"],
         "reward": credited_reward,
         "nominal_reward": nominal_reward,
-        "reward_capped": credited_reward < nominal_reward,
-        "balance_after": int(row["balance_after"]),
-        "played_at": row["played_at"].timestamp(),
-        "next_play_at": row["next_play_at"].timestamp(),
+        "reward_capped": (
+            credited_reward < nominal_reward
+        ),
+        "balance_after": int(
+            row["balance_after"]
+        ),
+        "played_at": (
+            row["played_at"].timestamp()
+        ),
+        "next_play_at": (
+            row["next_play_at"].timestamp()
+        ),
     }
 
 
-def get_game_state(cur, user_id, balance, now=None):
+def get_game_state(
+    cur,
+    user_id,
+    balance,
+    now=None,
+):
     if now is None:
         now = database_now(cur)
 
@@ -793,33 +1038,51 @@ def get_game_state(cur, user_id, balance, now=None):
     """, (user_id,))
 
     latest = cur.fetchone()
-    pending = get_pending_withdrawal(cur, user_id)
+
+    pending = get_pending_withdrawal(
+        cur,
+        user_id,
+    )
 
     remaining_seconds = 0
     next_play_at = None
     balance = int(balance)
-    balance_limit_reached = balance >= BALANCE_CAP
+
+    balance_limit_reached = (
+        balance >= BALANCE_CAP
+    )
 
     if latest:
         next_play_at = latest["next_play_at"]
+
         remaining_seconds = max(
             0,
-            math.ceil((next_play_at - now).total_seconds()),
+            math.ceil(
+                (next_play_at - now).total_seconds()
+            ),
         )
 
     return {
         "enabled": GAME_ENABLED,
+
         "can_play": (
             GAME_ENABLED
             and remaining_seconds == 0
             and pending is None
             and not balance_limit_reached
         ),
+
         "balance_cap": BALANCE_CAP,
         "balance_limit_reached": balance_limit_reached,
         "withdrawal_pending": pending is not None,
         "remaining_seconds": remaining_seconds,
-        "next_play_at": next_play_at.timestamp() if next_play_at else None,
+
+        "next_play_at": (
+            next_play_at.timestamp()
+            if next_play_at
+            else None
+        ),
+
         "server_time": now.timestamp(),
         "balance": balance,
         "last_round": public_round(latest),
@@ -831,14 +1094,20 @@ def get_game_state(cur, user_id, balance, now=None):
 
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "service": "mio-backend"})
+    return jsonify({
+        "status": "ok",
+        "service": "mio-backend",
+    })
 
 
 @app.route("/api/user")
 @authenticated
 def api_user(user):
     with db_transaction() as cur:
-        row = get_user_row(cur, user["id"])
+        row = get_user_row(
+            cur,
+            user["id"],
+        )
 
         if not row:
             return jsonify({
@@ -851,15 +1120,33 @@ def api_user(user):
                 "pending_withdrawals": [],
             })
 
-        pending = get_pending_withdrawals(cur, user["id"])
+        pending = get_pending_withdrawals(
+            cur,
+            user["id"],
+        )
 
         return jsonify({
             "balance": user_balance(row),
             "daily_enabled": row["daily_mio"] == 1,
-            "notifications": get_recent_notifications(cur, user["id"]),
+
+            "notifications": get_recent_notifications(
+                cur,
+                user["id"],
+            ),
+
             "not_started": False,
-            "withdrawn_today": get_withdrawn_today(cur, user["id"]),
-            "pending_withdrawal": pending[0] if pending else None,
+
+            "withdrawn_today": get_withdrawn_today(
+                cur,
+                user["id"],
+            ),
+
+            "pending_withdrawal": (
+                pending[0]
+                if pending
+                else None
+            ),
+
             "pending_withdrawals": pending,
         })
 
@@ -874,36 +1161,77 @@ def api_invite_link(user):
         }), 500
 
     return jsonify({
-        "link": f"https://t.me/{BOT_USERNAME}?start={user['id']}"
+        "link": (
+            f"https://t.me/{BOT_USERNAME}"
+            f"?start={user['id']}"
+        )
     })
 
 
-def create_withdrawal(user, target, withdraw_type):
+def create_withdrawal(
+    user,
+    target,
+    withdraw_type,
+):
     with db_transaction() as cur:
-        row = get_user_row(cur, user["id"], lock=True)
+        row = get_user_row(
+            cur,
+            user["id"],
+            lock=True,
+        )
 
         if not row:
-            return jsonify({"ok": False, "error": "not_started"}), 403
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
 
-        pending = get_pending_withdrawal(cur, user["id"])
+        pending = get_pending_withdrawal(
+            cur,
+            user["id"],
+        )
 
         if pending:
-            result = withdrawal_payload(cur, pending)
-            result.update({"ok": False, "error": "already_pending"})
+            result = withdrawal_payload(
+                cur,
+                pending,
+            )
+
+            result.update({
+                "ok": False,
+                "error": "already_pending",
+            })
+
             return jsonify(result), 409
 
         balance = user_balance(row)
 
         if balance <= 0:
-            return jsonify({"ok": False, "error": "zero_balance"}), 400
+            return jsonify({
+                "ok": False,
+                "error": "zero_balance",
+            }), 400
 
         cur.execute("""
             INSERT INTO withdraw_queue (
-                user_id, target_username, amount,
-                withdraw_type, status, created_time
+                user_id,
+                target_username,
+                amount,
+                withdraw_type,
+                status,
+                created_time
             )
-            VALUES (%s, %s, %s, %s, 0, %s)
-            RETURNING id, user_id, amount, status, withdraw_type
+
+            VALUES (
+                %s, %s, %s, %s, 0, %s
+            )
+
+            RETURNING
+                id,
+                user_id,
+                amount,
+                status,
+                withdraw_type
         """, (
             user["id"],
             target,
@@ -912,7 +1240,11 @@ def create_withdrawal(user, target, withdraw_type):
             time.time(),
         ))
 
-        result = withdrawal_payload(cur, cur.fetchone())
+        result = withdrawal_payload(
+            cur,
+            cur.fetchone(),
+        )
+
         result["ok"] = True
 
     return jsonify(result)
@@ -921,66 +1253,123 @@ def create_withdrawal(user, target, withdraw_type):
 @app.route("/api/withdraw", methods=["POST"])
 @authenticated
 def api_withdraw(user):
-    target = json_body().get("target")
+    target = json_body().get(
+        "target"
+    )
 
     if not isinstance(target, str):
-        return jsonify({"ok": False, "error": "invalid_target"}), 400
+        return jsonify({
+            "ok": False,
+            "error": "invalid_target",
+        }), 400
 
     target = target.strip()
 
-    if not re.fullmatch(r"@[A-Za-z0-9_]{1,32}", target):
-        return jsonify({"ok": False, "error": "invalid_target"}), 400
+    if not re.fullmatch(
+        r"@[A-Za-z0-9_]{1,32}",
+        target,
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "invalid_target",
+        }), 400
 
-    return create_withdrawal(user, target, "id")
+    return create_withdrawal(
+        user,
+        target,
+        "id",
+    )
 
 
 @app.route("/api/withdraw-bank", methods=["POST"])
 @authenticated
 def api_withdraw_bank(user):
-    card = json_body().get("card")
+    card = json_body().get(
+        "card"
+    )
 
     if not isinstance(card, str):
-        return jsonify({"ok": False, "error": "invalid_card"}), 400
+        return jsonify({
+            "ok": False,
+            "error": "invalid_card",
+        }), 400
 
     card = card.strip()
 
-    if not re.fullmatch(r"[0-9]{10,20}", card):
-        return jsonify({"ok": False, "error": "invalid_card"}), 400
+    if not re.fullmatch(
+        r"[0-9]{10,20}",
+        card,
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "invalid_card",
+        }), 400
 
-    return create_withdrawal(user, card, "card")
+    return create_withdrawal(
+        user,
+        card,
+        "card",
+    )
 
 
 @app.route("/api/withdraw-status")
 @authenticated
 def api_withdraw_status(user):
-    withdraw_id = request.args.get("withdraw_id")
+    withdraw_id = request.args.get(
+        "withdraw_id"
+    )
 
     if withdraw_id is not None:
-        if not re.fullmatch(r"[0-9]{1,18}", withdraw_id):
+        if not re.fullmatch(
+            r"[0-9]{1,18}",
+            withdraw_id,
+        ):
             return jsonify({
                 "ok": False,
                 "error": "invalid_withdraw_id",
             }), 400
 
-        withdraw_id = int(withdraw_id)
+        withdraw_id = int(
+            withdraw_id
+        )
 
     with db_transaction() as cur:
         if withdraw_id is None:
             cur.execute("""
-                SELECT id, user_id, amount, status, withdraw_type
+                SELECT
+                    id,
+                    user_id,
+                    amount,
+                    status,
+                    withdraw_type
                 FROM withdraw_queue
                 WHERE user_id=%s
                 ORDER BY id DESC
                 LIMIT 1
             """, (user["id"],))
+
         else:
             cur.execute("""
-                SELECT id, user_id, amount, status, withdraw_type
+                SELECT
+                    id,
+                    user_id,
+                    amount,
+                    status,
+                    withdraw_type
                 FROM withdraw_queue
-                WHERE user_id=%s AND id=%s
-            """, (user["id"], withdraw_id))
+                WHERE user_id=%s
+                  AND id=%s
+            """, (
+                user["id"],
+                withdraw_id,
+            ))
 
-        return jsonify(withdrawal_payload(cur, cur.fetchone()))
+        return jsonify(
+            withdrawal_payload(
+                cur,
+                cur.fetchone(),
+            )
+        )
 
 
 @app.route("/api/receipt", methods=["POST"])
@@ -988,30 +1377,53 @@ def api_withdraw_status(user):
 def api_receipt(user):
     with db_transaction() as cur:
         cur.execute("""
-            INSERT INTO receipt_request (user_id, request)
+            INSERT INTO receipt_request (
+                user_id,
+                request
+            )
+
             VALUES (%s, 1)
+
             ON CONFLICT (user_id)
-            DO UPDATE SET request=EXCLUDED.request
+            DO UPDATE SET
+                request=EXCLUDED.request
         """, (user["id"],))
 
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True
+    })
 
 
 @app.route("/api/daily/enable", methods=["POST"])
 @authenticated
 def api_daily_enable(user):
     with db_transaction() as cur:
-        row = get_user_row(cur, user["id"], lock=True)
+        row = get_user_row(
+            cur,
+            user["id"],
+            lock=True,
+        )
 
         if not row:
-            return jsonify({"ok": False, "error": "not_started"}), 403
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
 
-        current_balance = user_balance(row)
+        current_balance = user_balance(
+            row
+        )
 
         if row["daily_mio"] == 1:
-            return jsonify({"ok": True, "balance": current_balance})
+            return jsonify({
+                "ok": True,
+                "balance": current_balance,
+            })
 
-        if get_pending_withdrawal(cur, user["id"]):
+        if get_pending_withdrawal(
+            cur,
+            user["id"],
+        ):
             return jsonify({
                 "ok": False,
                 "error": "withdrawal_pending",
@@ -1019,31 +1431,59 @@ def api_daily_enable(user):
 
         daily_credit = max(
             0,
-            min(DAILY_AMOUNT, DAILY_BALANCE_CAP - current_balance),
+            min(
+                DAILY_AMOUNT,
+                DAILY_BALANCE_CAP - current_balance,
+            ),
         )
 
         cur.execute("""
             UPDATE users
-            SET daily_mio=1, balance=COALESCE(balance, 0) + %s
+
+            SET
+                daily_mio=1,
+                balance=COALESCE(balance, 0) + %s
+
             WHERE user_id=%s
+
             RETURNING balance
-        """, (daily_credit, user["id"]))
+        """, (
+            daily_credit,
+            user["id"],
+        ))
 
-        balance = int(cur.fetchone()["balance"])
+        balance = int(
+            cur.fetchone()["balance"]
+        )
 
-    return jsonify({"ok": True, "balance": balance})
+    return jsonify({
+        "ok": True,
+        "balance": balance,
+    })
 
 
 @app.route("/api/game/status")
 @authenticated
 def api_game_status(user):
     with db_transaction() as cur:
-        row = get_user_row(cur, user["id"], lock=True)
+        row = get_user_row(
+            cur,
+            user["id"],
+            lock=True,
+        )
 
         if not row:
-            return jsonify({"ok": False, "error": "not_started"}), 403
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
 
-        result = get_game_state(cur, user["id"], user_balance(row))
+        result = get_game_state(
+            cur,
+            user["id"],
+            user_balance(row),
+        )
+
         result["ok"] = True
 
     return jsonify(result)
@@ -1055,40 +1495,74 @@ def api_game_play(user):
     data = json_body()
 
     try:
-        request_id = str(uuid.UUID(str(data.get("request_id", ""))))
-    except (ValueError, TypeError, AttributeError):
+        request_id = str(
+            uuid.UUID(
+                str(data.get("request_id", ""))
+            )
+        )
+
+    except (
+        ValueError,
+        TypeError,
+        AttributeError,
+    ):
         return jsonify({
             "ok": False,
             "error": "invalid_request_id",
         }), 400
 
     with db_transaction() as cur:
-        row = get_user_row(cur, user["id"], lock=True)
+        row = get_user_row(
+            cur,
+            user["id"],
+            lock=True,
+        )
 
         if not row:
-            return jsonify({"ok": False, "error": "not_started"}), 403
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
 
         balance = user_balance(row)
 
         cur.execute("""
             SELECT *
             FROM mio_game_rounds
-            WHERE user_id=%s AND request_id=%s
-        """, (user["id"], request_id))
+            WHERE user_id=%s
+              AND request_id=%s
+        """, (
+            user["id"],
+            request_id,
+        ))
 
         previous_round = cur.fetchone()
 
         if previous_round:
-            result = get_game_state(cur, user["id"], balance)
+            result = get_game_state(
+                cur,
+                user["id"],
+                balance,
+            )
+
             result.update({
                 "ok": True,
                 "replayed": True,
-                "round": public_round(previous_round),
+                "round": public_round(
+                    previous_round
+                ),
             })
+
             return jsonify(result)
 
         now = database_now(cur)
-        game_state = get_game_state(cur, user["id"], balance, now=now)
+
+        game_state = get_game_state(
+            cur,
+            user["id"],
+            balance,
+            now=now,
+        )
 
         if not GAME_ENABLED:
             return jsonify({
@@ -1118,9 +1592,20 @@ def api_game_play(user):
                 "error": "cooldown",
             }), 429
 
-        symbols = [secrets.choice(GAME_SYMBOLS) for _ in range(3)]
-        nominal_reward = calculate_game_reward(symbols)
-        reward = min(nominal_reward, max(0, BALANCE_CAP - balance))
+        symbols = [
+            secrets.choice(GAME_SYMBOLS)
+            for _ in range(3)
+        ]
+
+        nominal_reward = calculate_game_reward(
+            symbols
+        )
+
+        reward = min(
+            nominal_reward,
+            max(0, BALANCE_CAP - balance),
+        )
+
         next_play_at = now + GAME_COOLDOWN
 
         cur.execute("""
@@ -1128,16 +1613,30 @@ def api_game_play(user):
             SET balance=COALESCE(balance, 0) + %s
             WHERE user_id=%s
             RETURNING balance
-        """, (reward, user["id"]))
+        """, (
+            reward,
+            user["id"],
+        ))
 
-        new_balance = int(cur.fetchone()["balance"])
+        new_balance = int(
+            cur.fetchone()["balance"]
+        )
 
         cur.execute("""
             INSERT INTO mio_game_rounds (
-                user_id, request_id, symbols, reward,
-                balance_after, played_at, next_play_at
+                user_id,
+                request_id,
+                symbols,
+                reward,
+                balance_after,
+                played_at,
+                next_play_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s
+            )
+
             RETURNING *
         """, (
             user["id"],
@@ -1152,13 +1651,18 @@ def api_game_play(user):
         round_row = cur.fetchone()
 
         result = get_game_state(
-            cur, user["id"], new_balance, now=now
+            cur,
+            user["id"],
+            new_balance,
+            now=now,
         )
 
         result.update({
             "ok": True,
             "replayed": False,
-            "round": public_round(round_row),
+            "round": public_round(
+                round_row
+            ),
         })
 
     return jsonify(result)
@@ -1177,7 +1681,11 @@ DOZ_LINES = (
     (2, 4, 6),
 )
 
-DOZ_RPS = ("rock", "paper", "scissors")
+DOZ_RPS = (
+    "rock",
+    "paper",
+    "scissors",
+)
 
 DOZ_BEATS = {
     "rock": "scissors",
@@ -1190,18 +1698,29 @@ def doz_result(board):
     for line in DOZ_LINES:
         mark = board[line[0]]
 
-        if mark and all(board[index] == mark for index in line):
+        if mark and all(
+            board[index] == mark
+            for index in line
+        ):
             return mark, list(line)
 
-    if all(mark is not None for mark in board):
+    if all(
+        mark is not None
+        for mark in board
+    ):
         return "draw", []
 
     return None, []
 
 
-def doz_next_board(board, index, mark):
+def doz_next_board(
+    board,
+    index,
+    mark,
+):
     updated = list(board)
     updated[index] = mark
+
     return tuple(updated)
 
 
@@ -1211,21 +1730,31 @@ def doz_hard_score(board, turn):
 
     if outcome == "X":
         return 1
+
     if outcome == "O":
         return -1
+
     if outcome == "draw":
         return 0
 
     scores = [
         doz_hard_score(
-            doz_next_board(board, index, turn),
+            doz_next_board(
+                board,
+                index,
+                turn,
+            ),
             "O" if turn == "X" else "X",
         )
         for index, mark in enumerate(board)
         if mark is None
     ]
 
-    return max(scores) if turn == "X" else min(scores)
+    return (
+        max(scores)
+        if turn == "X"
+        else min(scores)
+    )
 
 
 @lru_cache(maxsize=50000)
@@ -1234,36 +1763,65 @@ def doz_easy_score(board, turn):
 
     if outcome == "O":
         return 1.0
+
     if outcome == "X":
         return -1.0
+
     if outcome == "draw":
         return 0.0
 
     scores = [
         doz_easy_score(
-            doz_next_board(board, index, turn),
+            doz_next_board(
+                board,
+                index,
+                turn,
+            ),
             "O" if turn == "X" else "X",
         )
         for index, mark in enumerate(board)
         if mark is None
     ]
 
-    # در دست آسان، ربات فرصت برد کاربر را بیشتر می‌کند.
-    # حرکت‌های کاربر همچنان واقعی‌اند و برد تضمین نمی‌شود.
-    return max(scores) if turn == "X" else sum(scores) / len(scores)
+    # در دست آسان، فرصت برد کاربر بیشتر می‌شود.
+    # برد همچنان به حرکت‌های واقعی کاربر وابسته است.
+    return (
+        max(scores)
+        if turn == "X"
+        else sum(scores) / len(scores)
+    )
 
 
 def doz_ai_move(round_data):
-    outcome, _ = doz_result(round_data["board"])
+    outcome, _ = doz_result(
+        round_data["board"]
+    )
 
     if outcome is not None:
         return
 
-    scorer = doz_easy_score if round_data["easy"] else doz_hard_score
-    board = tuple(round_data["board"])
+    scorer = (
+        doz_easy_score
+        if round_data["easy"]
+        else doz_hard_score
+    )
+
+    board = tuple(
+        round_data["board"]
+    )
 
     options = [
-        (index, scorer(doz_next_board(board, index, "X"), "O"))
+        (
+            index,
+            scorer(
+                doz_next_board(
+                    board,
+                    index,
+                    "X",
+                ),
+                "O",
+            ),
+        )
         for index, mark in enumerate(board)
         if mark is None
     ]
@@ -1271,7 +1829,10 @@ def doz_ai_move(round_data):
     if not options:
         return
 
-    best = max(score for _, score in options)
+    best = max(
+        score
+        for _, score in options
+    )
 
     selected = secrets.choice([
         index
@@ -1280,15 +1841,24 @@ def doz_ai_move(round_data):
     ])
 
     round_data["board"][selected] = "X"
-    round_data["moves"].append({"player": "X", "index": selected})
+
+    round_data["moves"].append({
+        "player": "X",
+        "index": selected,
+    })
 
 
 def doz_new_series():
     return {
         "used": 0,
+
         "easy_rounds": sorted(
-            secrets.SystemRandom().sample(range(1, 6), 2)
+            secrets.SystemRandom().sample(
+                range(1, 6),
+                2,
+            )
         ),
+
         "reset_at": None,
         "round_id": None,
     }
@@ -1301,55 +1871,104 @@ def doz_public_round(round_data):
     return {
         key: round_data[key]
         for key in (
-            "id", "number", "phase", "version", "board", "moves",
-            "rps", "outcome", "winning_line", "reward", "nominal_reward"
+            "id",
+            "number",
+            "phase",
+            "version",
+            "board",
+            "moves",
+            "rps",
+            "outcome",
+            "winning_line",
+            "reward",
+            "nominal_reward",
         )
     } | {
         "reward_capped": (
-            round_data["reward"] < round_data["nominal_reward"]
+            round_data["reward"]
+            < round_data["nominal_reward"]
         )
     }
 
 
-def doz_save_series(cur, user_id, series):
+def doz_save_series(
+    cur,
+    user_id,
+    series,
+):
     cur.execute("""
         UPDATE mio_doz_sessions
-        SET data=%s, updated_at=clock_timestamp()
+
+        SET
+            data=%s,
+            updated_at=clock_timestamp()
+
         WHERE user_id=%s
-    """, (Json(series), user_id))
+    """, (
+        Json(series),
+        user_id,
+    ))
 
 
-def doz_save_round(cur, user_id, round_data):
+def doz_save_round(
+    cur,
+    user_id,
+    round_data,
+):
     cur.execute("""
         UPDATE mio_doz_rounds
-        SET data=%s, updated_at=clock_timestamp()
-        WHERE id=%s AND user_id=%s
-    """, (Json(round_data), round_data["id"], user_id))
+
+        SET
+            data=%s,
+            updated_at=clock_timestamp()
+
+        WHERE id=%s
+          AND user_id=%s
+    """, (
+        Json(round_data),
+        round_data["id"],
+        user_id,
+    ))
 
 
 # ================= DOZ API =================
 
 def handle_doz(user, action):
-    # پیش از هرگونه INSERT یا SELECT مربوط به دوز،
-    # جدول‌های لازم آماده و تراکنش ساخت آن‌ها commit می‌شود.
     ensure_doz_database()
 
     body = json_body()
     user_id = user["id"]
 
     with db_transaction() as cur:
-        row = get_user_row(cur, user_id, lock=True)
+        row = get_user_row(
+            cur,
+            user_id,
+            lock=True,
+        )
 
         if not row:
-            return jsonify({"ok": False, "error": "not_started"}), 403
+            return jsonify({
+                "ok": False,
+                "error": "not_started",
+            }), 403
 
-        now = database_now(cur).timestamp()
+        now = database_now(
+            cur
+        ).timestamp()
 
         cur.execute("""
-            INSERT INTO mio_doz_sessions (user_id, data)
+            INSERT INTO mio_doz_sessions (
+                user_id,
+                data
+            )
+
             VALUES (%s, %s)
+
             ON CONFLICT (user_id) DO NOTHING
-        """, (user_id, Json(doz_new_series())))
+        """, (
+            user_id,
+            Json(doz_new_series()),
+        ))
 
         cur.execute("""
             SELECT data
@@ -1360,9 +1979,17 @@ def handle_doz(user, action):
 
         series = cur.fetchone()["data"]
 
-        if series["reset_at"] is not None and now >= series["reset_at"]:
+        if (
+            series["reset_at"] is not None
+            and now >= series["reset_at"]
+        ):
             series = doz_new_series()
-            doz_save_series(cur, user_id, series)
+
+            doz_save_series(
+                cur,
+                user_id,
+                series,
+            )
 
         round_data = None
 
@@ -1370,21 +1997,49 @@ def handle_doz(user, action):
             cur.execute("""
                 SELECT data
                 FROM mio_doz_rounds
-                WHERE id=%s AND user_id=%s
-            """, (series["round_id"], user_id))
+                WHERE id=%s
+                  AND user_id=%s
+            """, (
+                series["round_id"],
+                user_id,
+            ))
 
             stored = cur.fetchone()
-            round_data = stored["data"] if stored else None
 
-        pending = get_pending_withdrawal(cur, user_id) is not None
+            round_data = (
+                stored["data"]
+                if stored
+                else None
+            )
+
+        pending = (
+            get_pending_withdrawal(
+                cur,
+                user_id,
+            )
+            is not None
+        )
 
         def snapshot():
             balance = user_balance(row)
-            active = bool(round_data and round_data["phase"] != "finished")
-            remaining = max(0, DOZ_SERIES_SIZE - series["used"])
+
+            active = bool(
+                round_data
+                and round_data["phase"] != "finished"
+            )
+
+            remaining = max(
+                0,
+                DOZ_SERIES_SIZE - series["used"],
+            )
 
             seconds = (
-                max(0, math.ceil(series["reset_at"] - now))
+                max(
+                    0,
+                    math.ceil(
+                        series["reset_at"] - now
+                    ),
+                )
                 if series["reset_at"] is not None
                 else 0
             )
@@ -1396,12 +2051,17 @@ def handle_doz(user, action):
                 "balance_cap": BALANCE_CAP,
                 "win_reward": DOZ_WIN_REWARD,
                 "draw_reward": DOZ_DRAW_REWARD,
-                "reward_configured": DOZ_WIN_REWARD is not None,
+
+                "reward_configured": (
+                    DOZ_WIN_REWARD is not None
+                ),
+
                 "withdrawal_pending": pending,
                 "remaining_rounds": remaining,
                 "remaining_seconds": seconds,
                 "reset_at": series["reset_at"],
                 "active": active,
+
                 "can_start": (
                     not active
                     and remaining > 0
@@ -1410,7 +2070,10 @@ def handle_doz(user, action):
                     and balance < BALANCE_CAP
                     and DOZ_WIN_REWARD is not None
                 ),
-                "round": doz_public_round(round_data),
+
+                "round": doz_public_round(
+                    round_data
+                ),
             }
 
         def fail(error, status=409):
@@ -1421,15 +2084,32 @@ def handle_doz(user, action):
             }), status
 
         if action == "status":
-            return jsonify(snapshot())
+            return jsonify(
+                snapshot()
+            )
 
         if action == "start":
             try:
                 request_id = str(
-                    uuid.UUID(str(body.get("request_id", "")))
+                    uuid.UUID(
+                        str(
+                            body.get(
+                                "request_id",
+                                "",
+                            )
+                        )
+                    )
                 )
-            except (ValueError, TypeError, AttributeError):
-                return fail("invalid_request_id", 400)
+
+            except (
+                ValueError,
+                TypeError,
+                AttributeError,
+            ):
+                return fail(
+                    "invalid_request_id",
+                    400,
+                )
 
             cur.execute("""
                 SELECT user_id
@@ -1444,40 +2124,72 @@ def handle_doz(user, action):
                     previous["user_id"] == user_id
                     and series["round_id"] == request_id
                 ):
-                    return jsonify({**snapshot(), "replayed": True})
+                    return jsonify({
+                        **snapshot(),
+                        "replayed": True,
+                    })
 
-                return fail("doz_old_request")
+                return fail(
+                    "doz_old_request"
+                )
 
-            if round_data and round_data["phase"] != "finished":
-                return jsonify({**snapshot(), "resumed": True})
+            if (
+                round_data
+                and round_data["phase"] != "finished"
+            ):
+                return jsonify({
+                    **snapshot(),
+                    "resumed": True,
+                })
 
             if DOZ_WIN_REWARD is None:
-                return fail("doz_reward_unconfigured", 503)
+                return fail(
+                    "doz_reward_unconfigured",
+                    503,
+                )
 
             if pending:
-                return fail("withdrawal_pending")
+                return fail(
+                    "withdrawal_pending"
+                )
 
             if user_balance(row) >= BALANCE_CAP:
-                return fail("balance_limit_reached")
+                return fail(
+                    "balance_limit_reached"
+                )
 
             if series["used"] >= DOZ_SERIES_SIZE:
-                return fail("doz_cooldown", 429)
+                return fail(
+                    "doz_cooldown",
+                    429,
+                )
 
             number = series["used"] + 1
 
             round_data = {
                 "id": request_id,
                 "number": number,
-                "easy": number in series["easy_rounds"],
+
+                "easy": (
+                    number in series["easy_rounds"]
+                ),
+
                 "phase": "rps",
                 "version": 0,
                 "board": [None] * 9,
                 "moves": [],
                 "receipts": {},
                 "rps": None,
-                # انتخاب دست سخت، قبل از دریافت انتخاب کاربر ثبت می‌شود.
-                "bot_pick": secrets.choice(DOZ_RPS),
-                "tie_starter": secrets.choice(("O", "X")),
+
+                # در دست سخت، انتخاب ربات پیش از انتخاب کاربر ثبت می‌شود.
+                "bot_pick": secrets.choice(
+                    DOZ_RPS
+                ),
+
+                "tie_starter": secrets.choice(
+                    ("O", "X")
+                ),
+
                 "win_reward": DOZ_WIN_REWARD,
                 "outcome": None,
                 "winning_line": [],
@@ -1486,43 +2198,84 @@ def handle_doz(user, action):
             }
 
             cur.execute("""
-                INSERT INTO mio_doz_rounds (id, user_id, data)
+                INSERT INTO mio_doz_rounds (
+                    id,
+                    user_id,
+                    data
+                )
+
                 VALUES (%s, %s, %s)
-            """, (request_id, user_id, Json(round_data)))
+            """, (
+                request_id,
+                user_id,
+                Json(round_data),
+            ))
 
             series["used"] = number
             series["round_id"] = request_id
 
-            doz_save_series(cur, user_id, series)
+            doz_save_series(
+                cur,
+                user_id,
+                series,
+            )
 
-            return jsonify(snapshot())
+            return jsonify(
+                snapshot()
+            )
 
-        if action not in {"rps", "move"}:
-            return fail("doz_unknown_action", 404)
+        if action not in {
+            "rps",
+            "move",
+        }:
+            return fail(
+                "doz_unknown_action",
+                404,
+            )
 
         if (
             not round_data
-            or str(body.get("round_id", "")) != round_data["id"]
+            or str(
+                body.get("round_id", "")
+            ) != round_data["id"]
         ):
-            return fail("doz_round_changed")
+            return fail(
+                "doz_round_changed"
+            )
 
         if action == "rps":
-            choice = body.get("choice")
+            choice = body.get(
+                "choice"
+            )
 
             if choice not in DOZ_RPS:
-                return fail("doz_invalid_choice", 400)
+                return fail(
+                    "doz_invalid_choice",
+                    400,
+                )
 
             if round_data["rps"] is not None:
-                if round_data["rps"]["human"] == choice:
-                    return jsonify(snapshot())
+                if (
+                    round_data["rps"]["human"]
+                    == choice
+                ):
+                    return jsonify(
+                        snapshot()
+                    )
 
-                return fail("doz_choice_locked")
+                return fail(
+                    "doz_choice_locked"
+                )
 
             if pending:
-                return fail("withdrawal_pending")
+                return fail(
+                    "withdrawal_pending"
+                )
 
             if round_data["phase"] != "rps":
-                return fail("doz_round_changed")
+                return fail(
+                    "doz_round_changed"
+                )
 
             bot_choice = (
                 DOZ_BEATS[choice]
@@ -1533,9 +2286,11 @@ def handle_doz(user, action):
             if choice == bot_choice:
                 winner = "draw"
                 starter = round_data["tie_starter"]
+
             elif DOZ_BEATS[choice] == bot_choice:
                 winner = "human"
                 starter = "O"
+
             else:
                 winner = "ai"
                 starter = "X"
@@ -1550,15 +2305,29 @@ def handle_doz(user, action):
             round_data["phase"] = "playing"
 
             if starter == "X":
-                doz_ai_move(round_data)
+                doz_ai_move(
+                    round_data
+                )
 
             round_data["version"] += 1
-            doz_save_round(cur, user_id, round_data)
 
-            return jsonify(snapshot())
+            doz_save_round(
+                cur,
+                user_id,
+                round_data,
+            )
 
-        index = body.get("index")
-        version = body.get("version")
+            return jsonify(
+                snapshot()
+            )
+
+        index = body.get(
+            "index"
+        )
+
+        version = body.get(
+            "version"
+        )
 
         if (
             not isinstance(index, int)
@@ -1568,45 +2337,82 @@ def handle_doz(user, action):
             or isinstance(version, bool)
             or version < 0
         ):
-            return fail("doz_invalid_move", 400)
+            return fail(
+                "doz_invalid_move",
+                400,
+            )
 
-        receipt_key = str(version)
-        previous_index = round_data["receipts"].get(receipt_key)
+        receipt_key = str(
+            version
+        )
+
+        previous_index = round_data[
+            "receipts"
+        ].get(
+            receipt_key
+        )
 
         if previous_index is not None:
             if previous_index == index:
-                return jsonify({**snapshot(), "replayed": True})
+                return jsonify({
+                    **snapshot(),
+                    "replayed": True,
+                })
 
-            return fail("doz_stale_move")
+            return fail(
+                "doz_stale_move"
+            )
 
         if round_data["phase"] != "playing":
-            return fail("doz_round_changed")
+            return fail(
+                "doz_round_changed"
+            )
 
         if round_data["version"] != version:
-            return fail("doz_stale_move")
+            return fail(
+                "doz_stale_move"
+            )
 
         if round_data["board"][index] is not None:
-            return fail("doz_occupied_cell")
+            return fail(
+                "doz_occupied_cell"
+            )
 
         if pending:
-            return fail("withdrawal_pending")
+            return fail(
+                "withdrawal_pending"
+            )
 
         round_data["board"][index] = "O"
-        round_data["moves"].append({"player": "O", "index": index})
 
-        outcome, _ = doz_result(round_data["board"])
+        round_data["moves"].append({
+            "player": "O",
+            "index": index,
+        })
+
+        outcome, _ = doz_result(
+            round_data["board"]
+        )
 
         if outcome is None:
-            doz_ai_move(round_data)
+            doz_ai_move(
+                round_data
+            )
 
-        round_data["receipts"][receipt_key] = index
+        round_data["receipts"][
+            receipt_key
+        ] = index
+
         round_data["version"] += 1
 
-        outcome, winning_line = doz_result(round_data["board"])
+        outcome, winning_line = doz_result(
+            round_data["board"]
+        )
 
         if outcome is not None:
             round_data["phase"] = "finished"
             round_data["winning_line"] = winning_line
+
             round_data["outcome"] = {
                 "O": "human",
                 "X": "ai",
@@ -1616,12 +2422,17 @@ def handle_doz(user, action):
             nominal = (
                 round_data["win_reward"]
                 if outcome == "O"
-                else DOZ_DRAW_REWARD if outcome == "draw" else 0
+                else DOZ_DRAW_REWARD
+                if outcome == "draw"
+                else 0
             )
 
             reward = min(
                 nominal,
-                max(0, BALANCE_CAP - user_balance(row)),
+                max(
+                    0,
+                    BALANCE_CAP - user_balance(row),
+                ),
             )
 
             if reward:
@@ -1630,32 +2441,56 @@ def handle_doz(user, action):
                     SET balance=COALESCE(balance, 0) + %s
                     WHERE user_id=%s
                     RETURNING balance
-                """, (reward, user_id))
+                """, (
+                    reward,
+                    user_id,
+                ))
 
-                row["balance"] = cur.fetchone()["balance"]
+                row["balance"] = cur.fetchone()[
+                    "balance"
+                ]
 
             round_data["reward"] = reward
             round_data["nominal_reward"] = nominal
 
             if series["used"] == DOZ_SERIES_SIZE:
-                series["reset_at"] = now + DOZ_COOLDOWN_SECONDS
+                series["reset_at"] = (
+                    now + DOZ_COOLDOWN_SECONDS
+                )
 
-        doz_save_round(cur, user_id, round_data)
-        doz_save_series(cur, user_id, series)
+        doz_save_round(
+            cur,
+            user_id,
+            round_data,
+        )
 
-        return jsonify(snapshot())
+        doz_save_series(
+            cur,
+            user_id,
+            series,
+        )
+
+        return jsonify(
+            snapshot()
+        )
 
 
 @app.route("/api/doz/status")
 @authenticated
 def api_doz_status(user):
-    return handle_doz(user, "status")
+    return handle_doz(
+        user,
+        "status",
+    )
 
 
 @app.route("/api/doz/<action>", methods=["POST"])
 @authenticated
 def api_doz_action(user, action):
-    return handle_doz(user, action)
+    return handle_doz(
+        user,
+        action,
+    )
 
 
 # ================= STARTUP =================
@@ -1669,8 +2504,12 @@ if __name__ == "__main__":
 
         app.run(
             host="0.0.0.0",
-            port=int(os.environ.get("PORT", 5000)),
+            port=int(
+                os.environ.get("PORT", 5000)
+            ),
         )
 
     else:
-        raise SystemExit("Usage: python server.py [--init-db]")
+        raise SystemExit(
+            "Usage: python server.py [--init-db]"
+        )
